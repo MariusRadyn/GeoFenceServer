@@ -71,8 +71,18 @@ echo "Activating virtual environment..."
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
+# ---------- 8. Upgrade pip ----------
 echo "Upgrading pip..."
 pip install --upgrade pip
+
+# ---------- 9. Install firebase-admin ----------
+if pip show firebase-admin &>/dev/null; then
+    echo "firebase-admin already installed."
+else
+    echo "Installing firebase-admin..."
+    pip install firebase-admin
+fi
+
 
 echo "Python version in venv:"
 python --version
