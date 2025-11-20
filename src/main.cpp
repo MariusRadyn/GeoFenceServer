@@ -8,7 +8,7 @@
 
 const char *ssid = "VoxFibre#59923";
 const char *password = "8JudJNS2";
-const char *serverIP = "192.168.1.108"; // <-- replace with your Pi's IP
+const char *serverIP = "192.168.1.108";
 const int port = 8080;
 
 #define DEBOUNCE_DELAY 100
@@ -21,76 +21,53 @@ WiFiClient wifiClient;
 PubSubClient pubClient(wifiClient);
 
 int CasePtr = 0;
-bool isDiscoverable = false;
+bool isBluetoothPairBusy = false;
+bool isBluetoothConnected = false;
+bool isWifiConnectingBusy = false;
+bool isWifiConnected = false;
+bool isRPiConnectingBusy = false;
+bool isRPiConnected = false;
 
-// Button Pair
-const int BUT_PAIR = 22; // GPIO22 button
+// Button Debounce
 volatile bool btnPairFallEdge = false;
 volatile bool btnPairPressed = false;
 volatile bool btnPairHeld = false;
 volatile int lastDebTime = 0;
 
-const int LED_ONBOARD = 2; // Built-in LED
-
-void SendHttpMsg(String msg);
-void buttonISR();
+// IO
+const int BUT_PAIR = 22; // BT Pair button
+const int LED_BLUETOOTH = 2; // Blink (Pairing), Solid (Connected) 
+const int LED_WIFI = 12; // Blink (Searching), Solid (Connected)
+const int LED_RPi = 13; // Blink (Searching), Solid (Connected)
+const int BUZZER = 23; // Buzzer
 
 // Declare task handle
 TaskHandle_t BlinkTaskHandle = NULL;
 TaskHandle_t ConnectWiFiTaskHandle = NULL;
 
 // Bluetooth
-const char* BT_NAME = "GeoServer"; // Bluetooth Name
+const String BT_NAME = "geoserver"; // Bluetooth Name
 NimBLECharacteristic* pChar;
 
 bool btConnected = false;
 bool wifiConnected = false;
 bool time_1sec_Flag = false;
 String deviceName;
+bool printDebug = false;
 
-class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
-     Serial.printf("Client connected: %s \n", connInfo.getAddress().toString().c_str());
-  }
-
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
-    Serial.printf("Client disconnected: %s \n", connInfo.getAddress().toString().c_str()); 
-     NimBLEDevice::startAdvertising();   
-  };
-};
-class HandshakeCallbacks : public NimBLECharacteristicCallbacks {
-  
-  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
-    std::string val = pCharacteristic->getValue();
-    Serial.print("RX: ");
-    Serial.println(val.c_str());
-
-    // Expected handshake from client
-    std::string ackClient = "ACK_FROM_CLIENT";  //From Raspberry Pi
-    std::string ackServer = "ACK_FROM_SERVER";  //From ESP32
-
-    if (val == ackClient.c_str()) {
-      // reply to client
-      pChar->setValue(ackServer);
-      pChar->notify(true);
-      Serial.printf("TX: %s\n", ackServer.c_str() );
-    } else {
-      // optional: echo back
-      std::string reply = "RX (unknown): ";
-      reply += val;
-      pChar->setValue(reply);
-      pChar->notify(true);
-    }
-  }
-
-  void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
-    // Raspberry PI Subscribed to notifications
-    Serial.println("Client subscribed to notifications\n");
-  }
-
-};
+// Declare functions
+void DebouncePairBtn();
+void SendHttpMsg(String msg);
+void buttonISR();
+void BT_StartServer();
+void BT_StartAdvertising();
 
 // General
+void PrintDebug(String msg, bool print){
+  if(print){
+    Serial.printf("%s\n",msg.c_str());
+  }
+}
 void IRAM_ATTR buttonISR()
 {
   btnPairFallEdge = true;
@@ -118,10 +95,7 @@ void DebouncePairBtn()
       if (currentTime - lastDebTime > DEBOUNCE_DELAY)
       {
         btnPairPressed = true;
-        isDiscoverable = false;
-        vTaskSuspend(BlinkTaskHandle);
-        digitalWrite(LED_ONBOARD, LOW);
-        Serial.println("Button Pressed");
+        PrintDebug("Button Pressed", printDebug);
       }
     }
   }
@@ -129,22 +103,27 @@ void DebouncePairBtn()
   {
     uint32_t currentTime = millis();
 
-    // Button HELD
+    // Start Bluetooth Pairing
+    // Button HELD 
     if (currentTime - lastDebTime > DEBOUNCE_DELAY_HELD)
     {
       btnPairHeld = true;
-      isDiscoverable = true;
+      isBluetoothPairBusy = true;
+      isBluetoothConnected = false;
       vTaskResume(BlinkTaskHandle);
-      Serial.println("Button Held");
+
+      BT_StartServer();
+      BT_StartAdvertising();
+      PrintDebug("Button HELD", printDebug);
     }
 
-    // Wait for release
+    // Wait for release before HELD
     if (digitalRead(BUT_PAIR) == HIGH)
     {
       btnPairPressed = false;
       btnPairHeld = false;
       lastDebTime = 0;
-      Serial.println("Button Released");
+      PrintDebug("Button Released", printDebug);
     }
   }
   else
@@ -155,30 +134,51 @@ void DebouncePairBtn()
       btnPairPressed = false;
       btnPairHeld = false;
       lastDebTime = 0;
-      Serial.println("Button Released");
+      PrintDebug("Button Released", printDebug);
     }
   }
 }
 void BlinkTask(void *parameter)
 {
   for (;;)
-  { // Infinite loop
-    digitalWrite(LED_ONBOARD, HIGH);
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1000ms
+  { 
+    if(isBluetoothPairBusy) digitalWrite(LED_BLUETOOTH, HIGH);
+    if(isWifiConnectingBusy) digitalWrite(LED_WIFI, HIGH);
+    vTaskDelay(500 / portTICK_PERIOD_MS);
 
-    digitalWrite(LED_ONBOARD, LOW);
+    if(isBluetoothPairBusy)digitalWrite(LED_BLUETOOTH, LOW);
+    if(isWifiConnectingBusy)digitalWrite(LED_WIFI, LOW);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    if(isWifiConnected) vTaskSuspend(BlinkTaskHandle);
   }
 }
 String getDeviceName(){
 // create a short unique id from efuse MAC (last 4 hex digits)
   uint64_t mac = ESP.getEfuseMac();
-  char idbuf[9];
-  snprintf(idbuf, sizeof(idbuf), "%04X", (uint16_t)(mac & 0xFFFF));
+  //printf("MAC: %llX\n", mac);
 
-  String deviceName = BT_NAME;
+  char idbuf[9];
+  snprintf(idbuf, sizeof(idbuf), "%08X", (uint32_t)(mac & 0xFFFFFFFF));
+
+  String deviceName = BT_NAME + "_";
   deviceName += idbuf;
+  deviceName.toLowerCase();
   return deviceName;
+}
+String GetMacAddress(){
+  uint64_t mac = ESP.getEfuseMac();
+  uint8_t macArr[6];
+  for (int i = 0; i < 6; i++) {
+    macArr[i] = (mac >> (8 * i)) & 0xFF;
+  }
+
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+          macArr[5], macArr[4], macArr[3], macArr[2], macArr[1], macArr[0]);
+
+  Serial.println(macStr);
+  return macStr;
 }
 
 // WiFi
@@ -259,6 +259,57 @@ void SendHttpMsg(String msg)
 }
 
 //Bluetooth
+class BT_ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
+     Serial.printf("BT Client connected: %s \n", connInfo.getAddress().toString().c_str());
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
+    Serial.printf("BT Client disconnected: %s \n", connInfo.getAddress().toString().c_str()); 
+     NimBLEDevice::startAdvertising();   
+  };
+};
+class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
+  
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+    String val = pCharacteristic->getValue();
+    Serial.print("RX: ");
+    Serial.println(val.c_str());
+
+    // Expected handshake from client
+    String ackClient = "BT_ACK_FROM_CLIENT_" + getDeviceName();  //From Raspberry Pi
+    String ackServer = "BT_ACK_FROM_SERVER_" + getDeviceName();  //From ESP32
+
+    if (val == ackClient.c_str()) {
+      
+      // reply to client
+      pChar->setValue(ackServer);
+      pChar->notify(true);
+      Serial.printf("TX: %s\n", ackServer.c_str() );
+
+      isBluetoothPairBusy = false;
+      isBluetoothConnected = true;
+      digitalWrite(LED_BLUETOOTH, HIGH);
+
+      Serial.printf("Handshake PASS\n");
+    } else {
+
+      // Unkown Reply
+      String reply = "RX (unknown): ";
+      reply += val;
+      pChar->setValue(reply);
+      pChar->notify(true);
+       
+      Serial.printf("RX (Unkown): Expect: %s, Actual: %s\n", ackServer.c_str() , val.c_str() );
+    }
+  }
+
+  void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+    // Raspberry PI Subscribed to notifications
+    Serial.println("BT Client subscribed to notifications\n");
+  }
+};
+
 void BT_StartServer(){
   Serial.print("Starting BT Server...\n"); 
 
@@ -269,7 +320,7 @@ void BT_StartServer(){
   
   // Create Server
   NimBLEServer *pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  pServer->setCallbacks(new BT_ServerCallbacks());
 
   // Create Comms Service
   NimBLEService *pService = pServer->createService(SERVICE_UUID);
@@ -279,7 +330,7 @@ void BT_StartServer(){
     NIMBLE_PROPERTY::WRITE | 
     NIMBLE_PROPERTY::NOTIFY
   );
-  pChar->setCallbacks(new HandshakeCallbacks());
+  pChar->setCallbacks(new BT_HandshakeCallbacks());
   pChar->setValue("IDLE");
 
   pService->start();
@@ -298,13 +349,14 @@ void BT_StartAdvertising() {
   scanResp.setName(deviceName.c_str());              // full name delivered in scan response
   pAdv->setScanResponseData(scanResp);
 
- // NimBLEDevice::startAdvertising();
- // Serial.printf("BT Advertising Started:  %s \n", deviceName.c_str());
+  NimBLEDevice::startAdvertising();
+  Serial.printf("BT Advertising Started:  %s \n", deviceName.c_str());
 }
 
 void setup(){
   Serial.begin(9600);
-  pinMode(LED_ONBOARD, OUTPUT);
+  pinMode(LED_BLUETOOTH, OUTPUT);
+  pinMode(LED_WIFI, OUTPUT);
   pinMode(BUT_PAIR, INPUT_PULLUP);
 
   deviceName = getDeviceName();
@@ -334,11 +386,11 @@ void setup(){
       1                       // Core 1
   );
 
-  vTaskSuspend(BlinkTaskHandle);
+  vTaskResume(BlinkTaskHandle);
   vTaskSuspend(ConnectWiFiTaskHandle);
 
-  BT_StartServer();
-  BT_StartAdvertising();
+  //BT_StartServer();
+  //BT_StartAdvertising();
 
   pubClient.setServer(serverIP, 1883);
   pubClient.setCallback(wifiCallback);
@@ -347,11 +399,4 @@ void setup(){
 void loop()
 {
   DebouncePairBtn();
-  
-  if (isDiscoverable) {
-    // Start Bluetooth Discovery
-    isDiscoverable = false;
-    NimBLEDevice::startAdvertising();
-    Serial.printf("BT Advertising Started:  %s \n", deviceName.c_str());
-  }
 }
