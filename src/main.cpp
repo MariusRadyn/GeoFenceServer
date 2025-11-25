@@ -5,28 +5,42 @@
 #include <NimBLEServer.h>
 #include <Arduino.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
 
-const char *ssid = "VoxFibre#59923";
-const char *password = "8JudJNS2";
-const char *serverIP = "192.168.1.108";
+Preferences prefs;
+
+// wifi
+WiFiClient wifiClient;
+PubSubClient wifiPublishClient(wifiClient);
+String ssid = "VoxFibre#59923";
+String password = "8JudJNS2";
+// const char *ssid = "VoxFibre#59923";
+// const char *password = "8JudJNS2";
+char serverIP[16];
 const int port = 8080;
+
+bool wifiCredentialsExist() {
+  prefs.begin("wifi", true);
+  bool ok = prefs.isKey("ssid") && prefs.isKey("pw");
+  prefs.end();
+  return ok;
+}
 
 #define DEBOUNCE_DELAY 100
 #define DEBOUNCE_DELAY_HELD 3000
 #define MS_DELAY 10
-#define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
-#define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
 
-WiFiClient wifiClient;
-PubSubClient pubClient(wifiClient);
-
-int CasePtr = 0;
-bool isBluetoothPairBusy = false;
+int wifiCasePtr = 0;
+int mainCasePtr = 0;
 bool isBluetoothConnected = false;
-bool isWifiConnectingBusy = false;
 bool isWifiConnected = false;
+bool isMqttServiceConnected = false;
 bool isRPiConnectingBusy = false;
 bool isRPiConnected = false;
+bool gotWifiCredentials = false;
+
+// Commands
+String CMD_SHARED_WIFI_CREDENTIALS = "wificred:"; // Format: wificred:ssid#password
 
 // Button Debounce
 volatile bool btnPairFallEdge = false;
@@ -34,11 +48,16 @@ volatile bool btnPairPressed = false;
 volatile bool btnPairHeld = false;
 volatile int lastDebTime = 0;
 
+//MQTT Topics
+const String MQTT_TOPIC_REQ = "device/settings/request";
+const String MQTT_TOPIC_RESPONSE = "device/settings/response";
+const String MQTT_TOPIC_CRED ="device/settings/credentials";
+
 // IO
 const int BUT_PAIR = 22; // BT Pair button
 const int LED_BLUETOOTH = 2; // Blink (Pairing), Solid (Connected) 
-const int LED_WIFI = 12; // Blink (Searching), Solid (Connected)
-const int LED_RPi = 13; // Blink (Searching), Solid (Connected)
+const int LED_WIFI_CONNECTED = 12; // Blink (Searching), Solid (Connected)
+const int LED_MQTT_CONNECTED = 13; // Blink (Searching), Solid (Connected)
 const int BUZZER = 23; // Buzzer
 
 // Declare task handle
@@ -46,6 +65,8 @@ TaskHandle_t BlinkTaskHandle = NULL;
 TaskHandle_t ConnectWiFiTaskHandle = NULL;
 
 // Bluetooth
+#define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
+#define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
 const String BT_NAME = "geoserver"; // Bluetooth Name
 NimBLECharacteristic* pChar;
 
@@ -107,13 +128,7 @@ void DebouncePairBtn()
     // Button HELD 
     if (currentTime - lastDebTime > DEBOUNCE_DELAY_HELD)
     {
-      btnPairHeld = true;
-      isBluetoothPairBusy = true;
-      isBluetoothConnected = false;
-      vTaskResume(BlinkTaskHandle);
-
-      BT_StartServer();
-      BT_StartAdvertising();
+      btnPairHeld = true;     
       PrintDebug("Button HELD", printDebug);
     }
 
@@ -142,15 +157,17 @@ void BlinkTask(void *parameter)
 {
   for (;;)
   { 
-    if(isBluetoothPairBusy) digitalWrite(LED_BLUETOOTH, HIGH);
-    if(isWifiConnectingBusy) digitalWrite(LED_WIFI, HIGH);
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    if(!isBluetoothConnected) digitalWrite(LED_BLUETOOTH, HIGH);
+    if(!isWifiConnected) digitalWrite(LED_WIFI_CONNECTED, HIGH);
+    if(!isMqttServiceConnected) digitalWrite(LED_MQTT_CONNECTED, HIGH);
+    
+    vTaskDelay(300 / portTICK_PERIOD_MS);
 
-    if(isBluetoothPairBusy)digitalWrite(LED_BLUETOOTH, LOW);
-    if(isWifiConnectingBusy)digitalWrite(LED_WIFI, LOW);
+    if(!isBluetoothConnected)digitalWrite(LED_BLUETOOTH, LOW);
+    if(!isWifiConnected)digitalWrite(LED_WIFI_CONNECTED, LOW);
+    if(!isMqttServiceConnected)digitalWrite(LED_MQTT_CONNECTED, LOW);
+
     vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-    if(isWifiConnected) vTaskSuspend(BlinkTaskHandle);
   }
 }
 String getDeviceName(){
@@ -180,6 +197,25 @@ String GetMacAddress(){
   Serial.println(macStr);
   return macStr;
 }
+void saveWifiCredentials(String ssid, String password, String ip) {
+  prefs.begin("wifi", false);  // namespace "wifi"
+  prefs.putString("ssid", ssid);
+  prefs.putString("pw",   password);
+  prefs.putString("ip",   ip);
+  prefs.end();
+}
+String loadSSID() {
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", "");
+  prefs.end();
+  return ssid;
+}
+String loadPassword() {
+  prefs.begin("wifi", true);
+  String pw = prefs.getString("pw", "");
+  prefs.end();
+  return pw;
+}
 
 // WiFi
 void wifiCallback(char* topic, byte* payload, unsigned int length) {
@@ -194,12 +230,14 @@ void wifiConnectTask(void *parameter)
   for (;;)
   { // Infinite loop
 
-    switch (CasePtr)
+    switch (wifiCasePtr)
     {
     case 0:
       WiFi.begin(ssid, password);
-      Serial.println("\nConnecting to WiFi...");
-      CasePtr++;
+      Serial.printf("\nConnecting to WiFi... %s:1883\n", serverIP);
+      wifiPublishClient.setServer(serverIP, 1883);
+      wifiPublishClient.setCallback(wifiCallback);
+      wifiCasePtr++;
       break;
 
     case 1:
@@ -208,30 +246,42 @@ void wifiConnectTask(void *parameter)
         Serial.print("IP address: ");
         Serial.println(WiFi.SSID());
         Serial.println(WiFi.localIP());
-        CasePtr++;
+        isWifiConnected = true;
+        wifiCasePtr++;
       }
       break;
 
     case 2:
-        //SendHttpMsg("Button Pressed");
         Serial.println("\nConnecting MQQT ...");
-        pubClient.connect("geoPublisher");
-        pubClient.loop();
 
+        if(wifiPublishClient.connect("geoPublisher")){
+          Serial.println("MQTT Connected!");
+          wifiPublishClient.loop();
+          wifiCasePtr++;
+        }
+        else
+        {
+          Serial.print("MQTT Connect failed, ");
+          Serial.print(wifiPublishClient.state());
+          Serial.println(" try again in 5 seconds");
+          delay(5000);
+        }
       break;
 
     case 3:
-      if (pubClient.connected()) {
+      if (wifiPublishClient.connected()) {
         Serial.println("\nConnected!\n");
         Serial.print("IP address: ");
         Serial.println(WiFi.localIP());
-        CasePtr++;
+        isMqttServiceConnected = true;
+        wifiCasePtr++;
       }
       break;
 
     case 4:
-        pubClient.publish("devices/esp32_1/status", "online");
-        delay(2000);
+        wifiPublishClient.publish(MQTT_TOPIC_RESPONSE.c_str(), "online");
+        Serial.printf("\nPublish topic...%s", MQTT_TOPIC_RESPONSE.c_str());
+        wifiCasePtr++;
       break;
 
     default:
@@ -261,55 +311,58 @@ void SendHttpMsg(String msg)
 //Bluetooth
 class BT_ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
-     Serial.printf("BT Client connected: %s \n", connInfo.getAddress().toString().c_str());
+    Serial.printf("BT Client connected: %s \n", connInfo.getAddress().toString().c_str());
+    isBluetoothConnected = true;
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
     Serial.printf("BT Client disconnected: %s \n", connInfo.getAddress().toString().c_str()); 
-     NimBLEDevice::startAdvertising();   
-  };
+    NimBLEDevice::startAdvertising();   
+    isBluetoothConnected = false;
+  }
 };
 class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
   
   void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+    
     String val = pCharacteristic->getValue();
     Serial.print("RX: ");
     Serial.println(val.c_str());
 
-    // Expected handshake from client
-    String ackClient = "BT_ACK_FROM_CLIENT_" + getDeviceName();  //From Raspberry Pi
-    String ackServer = "BT_ACK_FROM_SERVER_" + getDeviceName();  //From ESP32
+    // Recieved WiFi Credentials
+    if (val.startsWith("wificred:")) {
+      val.remove(0, 9);  // remove "wificred:"
 
-    if (val == ackClient.c_str()) {
-      
-      // reply to client
-      pChar->setValue(ackServer);
-      pChar->notify(true);
-      Serial.printf("TX: %s\n", ackServer.c_str() );
+      int i1 = val.indexOf(">");
+      int i2 = val.indexOf(">", i1 + 1);
 
-      isBluetoothPairBusy = false;
-      isBluetoothConnected = true;
-      digitalWrite(LED_BLUETOOTH, HIGH);
+      if (i1 != -1 && i2 != -1) {
 
-      Serial.printf("Handshake PASS\n");
-    } else {
+        ssid     = val.substring(0, i1);
+        password = val.substring(i1 + 1, i2);
+        
+        // IP address part
+        String ip = val.substring(i2 + 1);
+        ip.toCharArray(serverIP, sizeof(serverIP));  
+        
+        Serial.println("SSID: " + ssid);
+        Serial.println("Password: " + password);
+        Serial.println("ServerIP: " + String(serverIP));   // char*
 
-      // Unkown Reply
-      String reply = "RX (unknown): ";
-      reply += val;
-      pChar->setValue(reply);
-      pChar->notify(true);
-       
-      Serial.printf("RX (Unkown): Expect: %s, Actual: %s\n", ackServer.c_str() , val.c_str() );
+        gotWifiCredentials = true;
+      }
+      else {
+        Serial.println("Invalid WiFi credentials format: " + val);
+      }
     }
-  }
+  } 
+
 
   void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
     // Raspberry PI Subscribed to notifications
     Serial.println("BT Client subscribed to notifications\n");
   }
 };
-
 void BT_StartServer(){
   Serial.print("Starting BT Server...\n"); 
 
@@ -332,9 +385,7 @@ void BT_StartServer(){
   );
   pChar->setCallbacks(new BT_HandshakeCallbacks());
   pChar->setValue("IDLE");
-
   pService->start();
-
   Serial.printf("BT Server Started: %s\n", deviceName.c_str());
 }
 void BT_StartAdvertising() {
@@ -356,7 +407,8 @@ void BT_StartAdvertising() {
 void setup(){
   Serial.begin(9600);
   pinMode(LED_BLUETOOTH, OUTPUT);
-  pinMode(LED_WIFI, OUTPUT);
+  pinMode(LED_WIFI_CONNECTED, OUTPUT);
+  pinMode(LED_MQTT_CONNECTED, OUTPUT);
   pinMode(BUT_PAIR, INPUT_PULLUP);
 
   deviceName = getDeviceName();
@@ -386,17 +438,80 @@ void setup(){
       1                       // Core 1
   );
 
-  vTaskResume(BlinkTaskHandle);
-  vTaskSuspend(ConnectWiFiTaskHandle);
-
-  //BT_StartServer();
-  //BT_StartAdvertising();
-
-  pubClient.setServer(serverIP, 1883);
-  pubClient.setCallback(wifiCallback);
+  //vTaskResume(ConnectWiFiTaskHandle);
+  wifiCasePtr = 0;
+  mainCasePtr = 0;
 }
 
 void loop()
 {
+  vTaskDelay(10 / portTICK_PERIOD_MS);
   DebouncePairBtn();
+
+  switch (mainCasePtr)
+  {
+    // Start Bluetooth Server
+    case 0:
+      isBluetoothConnected = false;
+      isWifiConnected = false;
+      isMqttServiceConnected = false;
+
+      vTaskResume(BlinkTaskHandle);
+      vTaskSuspend(ConnectWiFiTaskHandle);
+
+      BT_StartServer();
+      BT_StartAdvertising();
+      mainCasePtr++;
+    break;
+    
+    // Wait for bluetooth Connection
+    case 1:
+      if (isBluetoothConnected)
+      {
+        digitalWrite(LED_BLUETOOTH, HIGH); // Solid ON
+        saveWifiCredentials(ssid, password, serverIP);
+        mainCasePtr++;
+      }
+    break;
+    
+    // Wait for Wifi Credentials via Bluetooth
+    case 2:
+     if(gotWifiCredentials)
+     {
+        // Start WiFi Connection
+        isWifiConnected = false;
+        isMqttServiceConnected = false;
+
+        vTaskResume(ConnectWiFiTaskHandle);
+        mainCasePtr++;
+     }
+    break;
+
+    // Check Wifi Connection
+    case 3:
+      if (isWifiConnected)
+      {
+        digitalWrite(LED_WIFI_CONNECTED, HIGH); // Solid ON
+        mainCasePtr++;
+      } 
+   
+      // Check MQTT Service Connection
+    case 4:
+      if (isMqttServiceConnected)
+      {
+        vTaskSuspend(ConnectWiFiTaskHandle);
+        digitalWrite(LED_MQTT_CONNECTED, HIGH); // Solid ON
+        mainCasePtr++;
+      } 
+    break;
+      case 5:
+      if(btnPairPressed){
+        btnPairPressed = false;
+        SendHttpMsg("Button Pressed");
+        Serial.println("Send HTTP: Button Pressed");
+      }
+      break;
+  default:
+    break;
+  }
 }
