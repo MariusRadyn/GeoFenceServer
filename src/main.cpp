@@ -11,7 +11,7 @@ Preferences prefs;
 
 // wifi
 WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+PubSubClient mqttServer(wifiClient);
 String ssid = "VoxFibre#59923";
 String password = "8JudJNS2";
 
@@ -69,13 +69,15 @@ TaskHandle_t ConnectWiFiTaskHandle = NULL;
 // Bluetooth
 #define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
 #define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
-const String BT_NAME = "geoserver"; // Bluetooth Name
-NimBLECharacteristic *pChar;
+const String BT_NAME = "iOT"; // Bluetooth Name
+NimBLECharacteristic *pChar = nullptr;
+NimBLEServer* pServer = nullptr;
+NimBLEService* pService = nullptr;
 
 bool btConnected = false;
 bool wifiConnected = false;
 bool time_1sec_Flag = false;
-String deviceName;
+String DeviceName;
 
 const bool PRINT_GENERAL_DEBUG = false;
 const bool PRINT_DEBOUNCE_DEBUG = true;
@@ -84,6 +86,7 @@ const bool PRINT_DEBOUNCE_DEBUG = true;
 void DebouncePairBtn();
 void SendHttpMsg(String msg);
 void buttonISR();
+void BT_StopServer();
 void BT_StartServer();
 void BT_StartAdvertising();
 void MqttTX(String,String);
@@ -182,19 +185,42 @@ void BlinkTask(void *parameter)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
-String getDeviceName(){
-  // create a short unique id from efuse MAC (last 4 hex digits)
+String xgetDeviceName(){
+  char idbuf[13];
   uint64_t mac = ESP.getEfuseMac();
-  // printf("MAC: %llX\n", mac);
+  snprintf(idbuf, sizeof(idbuf), "%012llX", mac); // uppercase
 
-  char idbuf[9];
-  snprintf(idbuf, sizeof(idbuf), "%08X", (uint32_t)(mac & 0xFFFFFFFF));
-
-  String deviceName = BT_NAME + "_";
-  deviceName += idbuf;
-  deviceName.toLowerCase();
-  return deviceName;
+  String name = BT_NAME + "_";
+  name += idbuf;
+  //name.toLowerCase();
+  return name;
 }
+String getDeviceName() {
+    // Read raw 48-bit efuse MAC (never modified)
+    uint64_t mac = ESP.getEfuseMac();
+
+    // Extract 6 bytes manually (correct order, no bit masking)
+    uint8_t macBytes[6];
+    for (int i = 0; i < 6; i++) {
+        macBytes[i] = (mac >> (8 * (5 - i))) & 0xFF;
+    }
+
+    // Format as 12-char hex string (uppercase)
+    char macStr[13];  // 12 hex chars + null
+    sprintf(macStr, "%02X%02X%02X%02X%02X%02X",
+            macBytes[5], macBytes[4], macBytes[3],
+            macBytes[2], macBytes[1], macBytes[0]);
+
+    // Build device name
+    String deviceName = BT_NAME + "_";
+    deviceName += macStr;
+
+    // Lowercase for BLE/MQTT safety (in-place)
+    //deviceName.toLowerCase();
+
+    return deviceName;
+}
+
 String GetMacAddress(){
   uint64_t mac = ESP.getEfuseMac();
   uint8_t macArr[6];
@@ -231,7 +257,7 @@ String loadPassword(){
 }
 
 // WiFi
-void wifiCallback(char *topic, byte *payload, unsigned int length){
+void mqttCallback(char *topic, byte *payload, unsigned int length){
   Serial.print("MQTT RX: [");
   Serial.print(topic);
   Serial.print("] ");
@@ -261,8 +287,8 @@ void wifiConnectTask(void *parameter){
 
         //wifiScanNetwork();
         WiFi.begin(ssid, password);
-        mqttClient.setServer(serverIP, 1883);
-        mqttClient.setCallback(wifiCallback);
+        mqttServer.setServer(serverIP, 1883);
+        mqttServer.setCallback(mqttCallback);
         delay(1000);
         wifiCasePtr++;
         break;
@@ -287,24 +313,24 @@ void wifiConnectTask(void *parameter){
 
       case 2:
         Serial.println("\nConnecting MQQT ...");
-
-        if (mqttClient.connect("geoPublisher"))
+        
+        if (mqttServer.connect(DeviceName.c_str()))
         {
           Serial.println("MQTT Connected!");
-          mqttClient.loop();
+          mqttServer.loop();
           wifiCasePtr++;
         }
         else
         {
           Serial.print("MQTT Connect failed, ERROR:");
-          Serial.print(mqttClient.state());
+          Serial.print(mqttServer.state());
           Serial.println(" try again in 5 seconds");
           delay(5000);
         }
         break;
 
       case 3:
-        if (mqttClient.connected())
+        if (mqttServer.connected())
         {
           Serial.println("\nConnected!\n");
           Serial.print("IP address: ");
@@ -315,10 +341,18 @@ void wifiConnectTask(void *parameter){
         break;
 
       case 4:
-        mqttClient.publish(MQTT_TOPIC_RESPONSE.c_str(), "online");
+        mqttServer.publish(MQTT_TOPIC_RESPONSE.c_str(), "online");
         Serial.printf("\nPublish topic...%s", MQTT_TOPIC_RESPONSE.c_str());
         wifiCasePtr++;
         break;
+      
+      case 5:
+        if(!mqttServer.connected()){
+          mainCasePtr = 0;
+        }
+        if (WiFi.status() != WL_CONNECTED)isWifiConnected = false;
+        else isWifiConnected = true;
+        delay(500);
 
       default:
         break;
@@ -346,7 +380,8 @@ void SendHttpMsg(String msg)
 void MqttTX(String msg, String topic){
   if (isWifiConnected)
   {
-    mqttClient.publish(topic.c_str(),msg.c_str());
+    msg = "<"+ DeviceName + ">" + msg;
+    mqttServer.publish(topic.c_str(),msg.c_str());
     Serial.println("MQTT TX: " + msg);
   }
   else
@@ -413,20 +448,32 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks{
     Serial.println("BT Client subscribed to notifications\n");
   }
 };
+void BT_StopServer() {
+    if (pServer != nullptr) {
+        Serial.println("Stopping existing BLE server...");
+        NimBLEDevice::stopAdvertising();
+        pServer->removeService(pService);
+        pService = nullptr;
+        pChar = nullptr;
+        NimBLEDevice::deinit(true);   // fully shuts down BLE
+        pServer = nullptr;
+        delay(100);
+    }
+}
 void BT_StartServer(){
+  BT_StopServer();
+
   Serial.print("Starting BT Server...\n");
 
-  String deviceName = getDeviceName();
-
-  NimBLEDevice::init(deviceName.c_str());
+  NimBLEDevice::init(DeviceName.c_str());
   NimBLEDevice::setSecurityAuth(false, false, true);
 
   // Create Server
-  NimBLEServer *pServer = NimBLEDevice::createServer();
+  pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new BT_ServerCallbacks());
 
   // Create Comms Service
-  NimBLEService *pService = pServer->createService(SERVICE_UUID);
+  pService = pServer->createService(SERVICE_UUID);
   pChar = pService->createCharacteristic(
       CHAR_UUID,
       NIMBLE_PROPERTY::READ |
@@ -435,7 +482,7 @@ void BT_StartServer(){
   pChar->setCallbacks(new BT_HandshakeCallbacks());
   pChar->setValue("IDLE");
   pService->start();
-  Serial.printf("BT Server Started: %s\n", deviceName.c_str());
+  Serial.printf("BT Server Started: %s\n", DeviceName.c_str());
 }
 void BT_StartAdvertising(){
   NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
@@ -446,11 +493,11 @@ void BT_StartAdvertising(){
   pAdv->setAdvertisementData(advData);
 
   NimBLEAdvertisementData scanResp;
-  scanResp.setName(deviceName.c_str()); // full name delivered in scan response
+  scanResp.setName(DeviceName.c_str()); // full name delivered in scan response
   pAdv->setScanResponseData(scanResp);
 
   NimBLEDevice::startAdvertising();
-  Serial.printf("BT Advertising Started:  %s \n", deviceName.c_str());
+  Serial.printf("BT Advertising Started:  %s \n", DeviceName.c_str());
 }
 
 void setup(){
@@ -460,7 +507,7 @@ void setup(){
   pinMode(LED_MQTT_CONNECTED, OUTPUT);
   pinMode(BUT_PAIR, INPUT_PULLUP);
 
-  deviceName = getDeviceName();
+  DeviceName = getDeviceName();
 
   attachInterrupt(
       digitalPinToInterrupt(BUT_PAIR),
@@ -507,6 +554,7 @@ void loop()
       isWifiConnected = false;
       isMqttServiceConnected = false;
       gotWifiCredentials = false;
+      wifiCasePtr = 0;
 
       vTaskResume(BlinkTaskHandle);
       vTaskSuspend(ConnectWiFiTaskHandle);
@@ -521,6 +569,7 @@ void loop()
       if (isBluetoothConnected)
       {
         digitalWrite(LED_BLUETOOTH, HIGH); // Solid ON
+        Serial.println("Waiting for Wifi Credentials ... ");
         mainCasePtr++;
       }
     break;
@@ -551,17 +600,22 @@ void loop()
     case 4:
       if (isMqttServiceConnected)
       {
-        vTaskSuspend(ConnectWiFiTaskHandle);
+        //vTaskSuspend(ConnectWiFiTaskHandle);
         digitalWrite(LED_MQTT_CONNECTED, HIGH); // Solid ON
         mainCasePtr++;
       }
     break;
   
     case 5:
+      mqttServer.loop();
+      
       if (btnPairPressed)
       {
         btnPairPressed = false;
+        bool connected = mqttServer.connected();
         MqttTX("Button Pressed", MQTT_TOPIC_REQ);
+        Serial.printf("MQTT Connected: %s\n", connected ? "true" : "false");
+        Serial.println(mqttServer.state());
       }
     break;
     
