@@ -51,9 +51,9 @@ volatile int debPairLastTime = 0;
 bool btnPairPressed = false;
 
 // MQTT Topics
-const String MQTT_TOPIC_REQ = "device/settings/request";
-const String MQTT_TOPIC_RESPONSE = "device/settings/response";
-const String MQTT_TOPIC_CRED = "device/settings/credentials";
+const String MQTT_TOPIC_FROM_IOT = "mqtt/from/iot";
+const String MQTT_TOPIC_TO_IOT = "mqtt/to/iot";
+const String MQTT_TOPIC_CRED = "mqtt/credentials";
 
 // IO
 const int BUT_PAIR = 22;           // BT Pair button
@@ -184,16 +184,6 @@ void BlinkTask(void *parameter)
    
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
-}
-String xgetDeviceName(){
-  char idbuf[13];
-  uint64_t mac = ESP.getEfuseMac();
-  snprintf(idbuf, sizeof(idbuf), "%012llX", mac); // uppercase
-
-  String name = BT_NAME + "_";
-  name += idbuf;
-  //name.toLowerCase();
-  return name;
 }
 String getDeviceName() {
     // Read raw 48-bit efuse MAC (never modified)
@@ -341,8 +331,8 @@ void wifiConnectTask(void *parameter){
         break;
 
       case 4:
-        mqttServer.publish(MQTT_TOPIC_RESPONSE.c_str(), "online");
-        Serial.printf("\nPublish topic...%s", MQTT_TOPIC_RESPONSE.c_str());
+        mqttServer.publish(MQTT_TOPIC_TO_IOT.c_str(), "online");
+        Serial.printf("\nPublish topic...%s", MQTT_TOPIC_TO_IOT.c_str());
         wifiCasePtr++;
         break;
       
@@ -613,7 +603,7 @@ void loop()
       {
         btnPairPressed = false;
         bool connected = mqttServer.connected();
-        MqttTX("Button Pressed", MQTT_TOPIC_REQ);
+        MqttTX("Button Pressed", MQTT_TOPIC_FROM_IOT);
         Serial.printf("MQTT Connected: %s\n", connected ? "true" : "false");
         Serial.println(mqttServer.state());
       }
