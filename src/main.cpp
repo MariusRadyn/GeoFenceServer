@@ -6,6 +6,10 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
+
+hw_timer_t *timer = NULL;
+volatile bool timerFlag = false;
 
 Preferences prefs;
 
@@ -50,10 +54,23 @@ volatile int debPairLastTime = 0;
 
 bool btnPairPressed = false;
 
+// MQTT Command
+const String MQTT_CMD_REQ_MONITOR = "#REQ_MONITOR";
+const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
+const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
+const String MQTT_CMD_ACK = "#ACK";
+
 // MQTT Topics
 const String MQTT_TOPIC_FROM_IOT = "mqtt/from/iot";
 const String MQTT_TOPIC_TO_IOT = "mqtt/to/iot";
+String MQTT_TOPIC_TO_IOT_PRIVATE = "";
 const String MQTT_TOPIC_CRED = "mqtt/credentials";
+
+// MQTT JSON
+const String MQTT_JSON_DEVICE_ID = "device_id";
+const String MQTT_JSON_TOPIC = "topic";
+const String MQTT_JSON_PAYLOAD = "payload";
+const String MQTT_JSON_CMD = "command";
 
 // IO
 const int BUT_PAIR = 22;           // BT Pair button
@@ -75,6 +92,11 @@ NimBLEServer* pServer = nullptr;
 NimBLEService* pService = nullptr;
 
 bool btConnected = false;
+bool isAdvertising = false;
+bool monitorFound = false;
+bool monitorRequested = false;
+const int ADVERTISE_TIMEOUT = 20; // seconds
+int runningTime = 0; // seconds
 bool wifiConnected = false;
 bool time_1sec_Flag = false;
 String DeviceName;
@@ -90,6 +112,17 @@ void BT_StopServer();
 void BT_StartServer();
 void BT_StartAdvertising();
 void MqttTX(String,String);
+
+//------------------------------------------------------------------------------------------------
+// Code
+//------------------------------------------------------------------------------------------------
+
+// Timer
+void IRAM_ATTR onTimerOneSec()
+{
+  timerFlag = true;
+}
+
 
 // General
 void PrintDebug(String msg, bool print){
@@ -163,26 +196,51 @@ void DebouncePairBtn()
     }
   }
 }
-void BlinkTask(void *parameter)
+void LedBlinkTask(void *parameter)
 {
+  int cntBluetooth = 0;
+  int cntWifi = 0;
+  int cntMqtt = 0;
+  int cntAdvertising = 0;
+
+  bool ledBluetoothState = LOW;
+  bool ledWifiState = LOW;
+  bool ledMqttState = LOW;
+  bool ledAdvertisingState = LOW;
+
   for (;;)
   {
-    if (!isBluetoothConnected) digitalWrite(LED_BLUETOOTH, HIGH);
-    if (!isWifiConnected) digitalWrite(LED_WIFI_CONNECTED, HIGH);
-    if (!isMqttServiceConnected) digitalWrite(LED_MQTT_CONNECTED, HIGH);
+    if (!isBluetoothConnected) {
+      if(cntBluetooth++ >= 300) {
+        cntBluetooth = 0;
+        ledBluetoothState = !ledBluetoothState;
 
-    vTaskDelay(300 / portTICK_PERIOD_MS);
+        if(ledBluetoothState) digitalWrite(LED_BLUETOOTH, HIGH);
+        else digitalWrite(LED_BLUETOOTH, LOW);
+      }
+    }  
 
-    if (!isBluetoothConnected) digitalWrite(LED_BLUETOOTH, LOW);
-    else digitalWrite(LED_BLUETOOTH, HIGH);
+    if (!isWifiConnected) {
+      if(cntWifi++ >= 500) {
+        cntWifi = 0;
+        ledWifiState = !ledWifiState;
 
-    if (!isWifiConnected) digitalWrite(LED_WIFI_CONNECTED, LOW);
-    else digitalWrite(LED_WIFI_CONNECTED, HIGH);
+        if(ledWifiState) digitalWrite(LED_WIFI_CONNECTED, HIGH);
+        else digitalWrite(LED_WIFI_CONNECTED, LOW);
+      }
+    }
     
-    if (!isMqttServiceConnected) digitalWrite(LED_MQTT_CONNECTED, LOW);
-    else digitalWrite(LED_MQTT_CONNECTED, HIGH);
+    if (!isMqttServiceConnected || isAdvertising) {
+      if(cntMqtt++ >= 700) {
+        cntMqtt = 0;
+        ledMqttState = !ledMqttState;
+
+        if(ledMqttState) digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        else digitalWrite(LED_MQTT_CONNECTED, LOW);
+      }
+    }
    
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
 String getDeviceName() {
@@ -210,7 +268,6 @@ String getDeviceName() {
 
     return deviceName;
 }
-
 String GetMacAddress(){
   uint64_t mac = ESP.getEfuseMac();
   uint8_t macArr[6];
@@ -246,15 +303,72 @@ String loadPassword(){
   return pw;
 }
 
-// WiFi
+// MQTT
 void mqttCallback(char *topic, byte *payload, unsigned int length){
+  
+  String msg = "";
+  
   Serial.print("MQTT RX: [");
   Serial.print(topic);
   Serial.print("] ");
+  
   for (int i = 0; i < length; i++)
-    Serial.print((char)payload[i]);
-  Serial.println();
+    msg += (char)payload[i];
+  Serial.println(msg);
+
+  // 2️⃣ Parse JSON
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+ 
+  if (error) {
+      Serial.print("JSON parse failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+    
+  String _payload = doc[MQTT_JSON_PAYLOAD];
+  String _topic = doc[MQTT_JSON_TOPIC];
+  String _cmd = doc[MQTT_JSON_CMD];
+
+  if(_topic == MQTT_TOPIC_TO_IOT){
+  
+    // Monitor Found
+    if(_cmd == MQTT_CMD_FOUND_MONITOR){  
+     monitorFound = true;
+    }
+
+    // Request Monitor 
+    if(_cmd == MQTT_CMD_REQ_MONITOR){  
+     monitorRequested = true;
+    }
+  }
 }
+void MqttTX(const JsonDocument& msg, const String& topic)
+{
+  if (!isWifiConnected) {
+    Serial.println("WiFi not connected");
+    return;
+  }
+
+  if (!mqttServer.connected()) {
+    Serial.println("MQTT not connected");
+    return;
+  }
+
+  String payload;
+  serializeJson(msg, payload);
+
+  bool ok = mqttServer.publish(topic.c_str(), payload.c_str());
+
+  if (ok) {
+    Serial.print("MQTT TX: ");
+    Serial.println(payload);   // Safe, prints the JSON string
+  } else {
+    Serial.println("MQTT publish failed");
+  }
+}
+
+// Wifi
 void wifiScanNetwork(){
   int n = WiFi.scanNetworks();
   Serial.printf("Scan done %i", n);
@@ -270,7 +384,8 @@ void wifiConnectTask(void *parameter){
   { 
     switch (wifiCasePtr)
     {
-      case 0:
+      // Connecting Wifi
+      case 0: 
       {
         Serial.printf("\nConnecting WiFi... %s:1883\n", serverIP);
         retry = 2;
@@ -281,9 +396,12 @@ void wifiConnectTask(void *parameter){
         mqttServer.setCallback(mqttCallback);
         delay(1000);
         wifiCasePtr++;
-        break;
       }
+      break;
+              
+      // Wifi Connected
       case 1:
+      {
         if (WiFi.status() == WL_CONNECTED)
         {
           Serial.println("\nConnected!");
@@ -299,9 +417,12 @@ void wifiConnectTask(void *parameter){
           delay(1000);
           if(retry-- == 0) wifiCasePtr = 0;
         }
-        break;
+      }
+      break;
 
+      // Connecting MQTT
       case 2:
+      {
         Serial.println("\nConnecting MQQT ...");
         
         if (mqttServer.connect(DeviceName.c_str()))
@@ -317,9 +438,12 @@ void wifiConnectTask(void *parameter){
           Serial.println(" try again in 5 seconds");
           delay(5000);
         }
-        break;
+      }
+      break;
 
+      // MQTT Connect
       case 3:
+      {
         if (mqttServer.connected())
         {
           Serial.println("\nConnected!\n");
@@ -328,22 +452,41 @@ void wifiConnectTask(void *parameter){
           isMqttServiceConnected = true;
           wifiCasePtr++;
         }
-        break;
+      }
+      break;
 
+      // Subscribe MQTT Topics
       case 4:
-        mqttServer.publish(MQTT_TOPIC_TO_IOT.c_str(), "online");
-        Serial.printf("\nPublish topic...%s", MQTT_TOPIC_TO_IOT.c_str());
+      {
+        // Broadcast Subscribe
+        mqttServer.subscribe(MQTT_TOPIC_TO_IOT.c_str());
+        Serial.printf("\nMQTT Subscribe ...%s", MQTT_TOPIC_TO_IOT.c_str());
+        
+        // Private Subscribe
+        MQTT_TOPIC_TO_IOT_PRIVATE = MQTT_TOPIC_TO_IOT + '/' + DeviceName;
+        mqttServer.subscribe(MQTT_TOPIC_TO_IOT_PRIVATE.c_str());
+        Serial.printf("\nMQTT Subscribe ...%s\n", MQTT_TOPIC_TO_IOT_PRIVATE.c_str());
+        
         wifiCasePtr++;
-        break;
-      
+      }
+      break;
+
+      // Keep MQTT alive - Check Connection
       case 5:
+      {
+        mqttServer.loop();  // Keep MQTT Alive
+
         if(!mqttServer.connected()){
           mainCasePtr = 0;
         }
+
         if (WiFi.status() != WL_CONNECTED)isWifiConnected = false;
         else isWifiConnected = true;
+        
         delay(500);
-
+      }
+      break;
+      
       default:
         break;
     }
@@ -365,18 +508,6 @@ void SendHttpMsg(String msg)
   else
   {
     Serial.println("MQTT TX: Failed");
-  }
-}
-void MqttTX(String msg, String topic){
-  if (isWifiConnected)
-  {
-    msg = "<"+ DeviceName + ">" + msg;
-    mqttServer.publish(topic.c_str(),msg.c_str());
-    Serial.println("MQTT TX: " + msg);
-  }
-  else
-  {
-    Serial.println("Wifi not Connected");
   }
 }
 
@@ -499,13 +630,21 @@ void setup(){
 
   DeviceName = getDeviceName();
 
+  // timer 0, prescaler 80 → 1 tick = 1 µs
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &onTimerOneSec, true);
+
+  // 1,000,000 µs = 1 second
+  timerAlarmWrite(timer, 1000000, true);
+  timerAlarmEnable(timer);
+
   attachInterrupt(
       digitalPinToInterrupt(BUT_PAIR),
       buttonISR,
       FALLING);
 
   xTaskCreatePinnedToCore(
-      BlinkTask,        // Task function
+      LedBlinkTask,        // Task function
       "BlinkTask",      // Task name
       10000,            // Stack size (bytes)
       NULL,             // Parameters
@@ -536,10 +675,9 @@ void loop()
   vTaskDelay(10 / portTICK_PERIOD_MS);
   DebouncePairBtn();
 
-  switch (mainCasePtr)
-  {
+  switch (mainCasePtr) {
     // Start Bluetooth Server
-    case 0:
+    case 0:{
       isBluetoothConnected = false;
       isWifiConnected = false;
       isMqttServiceConnected = false;
@@ -552,20 +690,22 @@ void loop()
       BT_StartServer();
       BT_StartAdvertising();
       mainCasePtr++;
+    }
     break;
 
     // Wait for bluetooth Connection
-    case 1:
+    case 1:{
       if (isBluetoothConnected)
       {
         digitalWrite(LED_BLUETOOTH, HIGH); // Solid ON
         Serial.println("Waiting for Wifi Credentials ... ");
         mainCasePtr++;
       }
+    }
     break;
 
     // Wait for Wifi Credentials via Bluetooth
-    case 2:
+    case 2:{
       if (gotWifiCredentials)
       {
         // Start WiFi Connection
@@ -576,40 +716,138 @@ void loop()
         vTaskResume(ConnectWiFiTaskHandle);
         mainCasePtr++;
       }
+    }
     break;
 
     // Check Wifi Connection
-    case 3:
+    case 3:{
       if (isWifiConnected)
       {
         digitalWrite(LED_WIFI_CONNECTED, HIGH); // Solid ON
         mainCasePtr++;
       }
+    }
+    break;
 
     // Check MQTT Service Connection
-    case 4:
+    case 4:{
       if (isMqttServiceConnected)
       {
-        //vTaskSuspend(ConnectWiFiTaskHandle);
         digitalWrite(LED_MQTT_CONNECTED, HIGH); // Solid ON
         mainCasePtr++;
       }
+    }
     break;
   
-    case 5:
-      mqttServer.loop();
+    // Send Device Name
+    case 5:{
+      StaticJsonDocument<256> mqttPacket;
+      mqttPacket[MQTT_JSON_DEVICE_ID] = DeviceName;
+      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+      mqttPacket[MQTT_JSON_PAYLOAD] = "";
+      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_DEVICE_ID;
       
+      String payload;
+      serializeJson(mqttPacket, payload);      
+      MqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+      mainCasePtr++;
+    }
+    break;
+
+    // Idle - Wait for Pair Button Press
+    case 6:{
       if (btnPairPressed)
       {
         btnPairPressed = false;
-        bool connected = mqttServer.connected();
-        MqttTX("Button Pressed", MQTT_TOPIC_FROM_IOT);
-        Serial.printf("MQTT Connected: %s\n", connected ? "true" : "false");
-        Serial.println(mqttServer.state());
+        isAdvertising = true;
+        monitorFound = false;
+        monitorRequested = false;
+        runningTime = 0;
+  
+        if(mqttServer.connected()){
+          timerAlarmEnable(timer);
+          Serial.printf("Advertising Device ID... %s\n", DeviceName.c_str());
+          mainCasePtr++;
+        }
+        else{
+          Serial.println("MQTT not connected, Cant advertise ID");
+          mqttServer.connect(DeviceName.c_str());
+        }
       }
+    }
     break;
     
-    default:
+    // Waiting for Monitor to be Found
+    case 7:{
+      // Keep MQTT Alive
+      mqttServer.loop();
+      
+      // Monitor Requested
+      if(monitorRequested){
+        monitorRequested = false;
+        
+        StaticJsonDocument<256> mqttPacket;
+        mqttPacket[MQTT_JSON_DEVICE_ID] = DeviceName;
+        mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+        mqttPacket[MQTT_JSON_PAYLOAD] = DeviceName;
+        mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_REQ_MONITOR;
+
+        String payload;
+        serializeJson(mqttPacket, payload);      
+        MqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+      }
+
+      // Monitor Found (From Android)
+      if(monitorFound) { 
+        timerAlarmDisable(timer);
+        isAdvertising = false;
+        
+        // Send Confirmation MQTT
+        StaticJsonDocument<256> mqttPacket;
+        mqttPacket[MQTT_JSON_DEVICE_ID] = DeviceName;
+        mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+        mqttPacket[MQTT_JSON_PAYLOAD] = DeviceName;
+        mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_FOUND_MONITOR;
+
+        String payload;
+        serializeJson(mqttPacket, payload);      
+        MqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+
+        digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        Serial.println("Monitor Found");  
+        mainCasePtr = 6;
+      }
+      
+      // User Cancelled
+      if(btnPairPressed) {
+          btnPairPressed = false;
+          timerAlarmDisable(timer);
+          mainCasePtr = 6;
+          isAdvertising = false;
+          monitorFound = false;
+        
+          digitalWrite(LED_MQTT_CONNECTED, HIGH);
+          Serial.println("User Cancelled Advertising");
+          mainCasePtr = 6;  
+      }
+
+      if (timerFlag) {
+        timerFlag = false;
+
+         // Timeout 20s
+        if(runningTime++ >= ADVERTISE_TIMEOUT){
+          timerAlarmDisable(timer);
+          isAdvertising = false;
+          Serial.println("Advertising Timeout");
+          mainCasePtr = 6;
+        }
+         // Re-Advertise
+         mainCasePtr = 7;
+      }
+    }
     break;
+        
+    default:
+    break; 
   }
 }
