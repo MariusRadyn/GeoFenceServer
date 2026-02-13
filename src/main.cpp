@@ -8,6 +8,8 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include "time.h"
 
 const String VERSION = "V1.0";
 
@@ -19,6 +21,7 @@ Preferences prefs;
 // wifi
 WiFiClient wifiClient;
 PubSubClient mqttServer(wifiClient);
+
 String ssid = "";
 String password = "";
 
@@ -40,10 +43,14 @@ constexpr const char *IOT_TYPE_STATIONARY_MACHINE = "Stationary Machine";
 constexpr const char *IOT_TYPE_WHEEL = "Distance Wheel";
 
 // Flash Settings
-constexpr const char *SETTING_TICKS_PER_M = "ticksPerM";
-constexpr const char *SETTING_IOT_TYPE = "iotType";
+constexpr const char *FLASH_SET_TICKS_PER_M = "ticksPerM";
+constexpr const char *FLASH_SET_IOT_TYPE = "iotType";
+constexpr const char *FLASH_SET_USER_ID = "userId";
+constexpr const char *FLASH_SET_MONITOR_DOC_ID = "monDocId";
 
 char settingsIotType[32] = {0};
+char settingsUserId[32] = {0};
+char settingsMonDocId[32] = {0};
 int32_t settingsTicksPerMeter = 0;
 
 int wifiCasePtr = 0;
@@ -114,26 +121,32 @@ const String MQTT_JSON_WHEEL_DISTANCE = "wheel_distance";
 const String MQTT_JSON_MEASUREMENTS = "measurements";
 const String MQTT_JSON_DATA = "data";
 
-const String JSON_SETTING_OPERATOR = "operator";
-const String JSON_SETTING_FOREMAN = "foreman";
-const String JSON_SETTING_DISTANCE = "distance";
-const String JSON_SETTING_LINES = "lines";  
+const String JSON_SET_OPERATOR = "operator";
+const String JSON_SET_SUPERVISOR = "supervisor";
+const String JSON_SET_DISTANCE = "distance";
+const String JSON_SET_LINES = "lines";  
+const String JSON_SET_TIMESTAMP = "timestamp";  
+const String JSON_SET_TICKS_PER_M = "ticksPerM";
+const String JSON_USER_ID = "userId";  
+const String JSON_MONITOR_DOC_ID = "docId";  
+const String JSON_IOT_TYPE = "iotType";  
 
 // FLASH Data Structure
 struct Measure {
   char nameOperator[17];     // max 16 chars + null
-  char nameForeman[17];     // max 16 chars + null
+  char nameSupervisor[17];     // max 16 chars + null
   float distance;
   int lines;
 };
 
 Measure thisMeasure;    
 uint8_t measureCount = 0;
-uint8_t measureIndex = 0;
+int8_t measureIndex = 0;
 const char* FLASH_MEASURE_KEY = "measures";
 const char* FLASH_MEASURE_DATA = "data";
+const char* FLASH_SETTINGS = "settings";
 
-#define MQTT_PAYLOAD_MAX 255
+#define MQTT_PAYLOAD_MAX 512
 using MqttJsonDoc = StaticJsonDocument<
   JSON_OBJECT_SIZE(5) +               // root
   JSON_OBJECT_SIZE(2) +               // payload
@@ -244,11 +257,12 @@ bool backKeyPressed = false;
 bool upKeyPressed = false;
 bool downKeyPressed = false;
 bool newNumKeyPressed = false;
-bool isPairing = false;
+bool startPairing = false;
 bool btConnected = false;
 bool wifiConnected = false;
-bool isAdvertising = false;
+bool isPairing = false;
 bool androidConnected = false;
+bool newSettingsRecieved = false;
 bool dataACK = false;
 bool isRunning = false;
 
@@ -258,6 +272,7 @@ int batteryLevel = 81; // Percentage
 // Debug
 const bool PRINT_ERRORS = true;
 const bool PRINT_GENERAL_DEBUG = true;
+const bool PRINT_FLASH_DEBUG = true;
 const bool PRINT_CREDENTIALS_DEBUG = true;
 const bool PRINT_WIFI_DEBUG = true;
 const bool PRINT_BT_DEBUG = true;
@@ -296,6 +311,48 @@ bool wifiCredentialsExist();
 //------------------------------------------------------------------------------------------------
 // Code
 //------------------------------------------------------------------------------------------------
+
+// Time and Date
+void setTime()
+{
+  struct tm timeinfo;
+  time_t now;
+  const char* ntpServer = "pool.ntp.org";
+  const long  gmtOffset_sec = 0;        // adjust for your timezone
+  const int   daylightOffset_sec = 0;
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  setenv("TZ", "SAST-2", 1);     // South Africa Standard Time
+  tzset();
+
+  if (getLocalTime(&timeinfo)) {
+      time(&now);
+      localtime_r(&now, &timeinfo);
+
+      PrintDebug(String("Time synced: "), PRINT_GENERAL_DEBUG);
+      Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+  } 
+  else {
+    PrintDebug("Time FAILED synced", PRINT_GENERAL_DEBUG);
+  }
+}
+String getTimeDateString(){
+  time_t now;
+  struct tm timeinfo;
+
+  time(&now);
+  localtime_r(&now, &timeinfo);
+
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+  return String(buffer);
+}
+time_t getTimeStamp(){
+  time_t now;
+  time(&now);
+  return now;
+}
 
 // Timer
 void IRAM_ATTR onTimerOneSec()
@@ -400,29 +457,31 @@ void GeneralTask(void *parameter)
     else
     {
 
+      // Blue - Bluetooth
       if (isBluetoothConnected)
         digitalWrite(LED_BLUETOOTH, HIGH); // Blue
       else
         digitalWrite(LED_BLUETOOTH, LOW);
 
+      // Red - Wifi 
       if (isWifiConnected)
         digitalWrite(LED_WIFI_CONNECTED, HIGH); // Red
       else
         digitalWrite(LED_WIFI_CONNECTED, LOW);
 
-      if (isAdvertising)
+      // Green
+      if (isPairing)
       {
         if (delay++ >= 700)
         {
           delay = 0;
           ledMqttState = !ledMqttState;
 
-          if (ledMqttState)
-            digitalWrite(LED_MQTT_CONNECTED, HIGH); // Green
-          else
-            digitalWrite(LED_MQTT_CONNECTED, LOW);
+          if (ledMqttState) digitalWrite(LED_MQTT_CONNECTED, HIGH); // Green
+          else  digitalWrite(LED_MQTT_CONNECTED, LOW);
         }
       }
+      else if(!isPairing && isMqttServiceConnected) digitalWrite(LED_MQTT_CONNECTED, HIGH);
     }
 
     // Keypad
@@ -444,6 +503,8 @@ void GeneralTask(void *parameter)
       
       // Stop / Pair
       else if (strcmp(key, KEY_STOP) == 0){
+        stopKeyPressed = true;
+
         if (!isPairing && !isRunning){
           if (pairModePressCount == 0){
             startTimout(5); // 5 seconds to enter isPairing mode
@@ -452,7 +513,8 @@ void GeneralTask(void *parameter)
           if (++pairModePressCount >= PAIR_MODE_PRESS_COUNT){
             pairModePressCount = 0;
             PrintDebug("Pairing MODE", PRINT_GENERAL_DEBUG);
-            isPairing = true;
+            startPairing = true;
+            stopKeyPressed = false;
           }
         }
       }
@@ -546,6 +608,7 @@ void wifiConnectTask(void *parameter){
         mqttServer.setServer(serverIP, 1883);
         mqttServer.setCallback(mqttRx);
 
+        setTime();
         wifiCasePtr++;
       }
     }
@@ -554,6 +617,8 @@ void wifiConnectTask(void *parameter){
     // Connecting MQTT
     case 5:
     {
+      mqttServer.setBufferSize(512);
+
       if (mqttServer.connect(myDeviceId.c_str()))
       {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
@@ -591,7 +656,7 @@ void wifiConnectTask(void *parameter){
     }
     break;
 
-    // Keep MQTT alive - Check Connection
+    // IDLE
     case 7:
     {
       mqttServer.loop(); // Keep MQTT Alive
@@ -603,9 +668,13 @@ void wifiConnectTask(void *parameter){
       }
 
       // Push measurements
-      if(measureCount > 0 && retry != 0) {
-        measureIndex = measureCount-1;
-        wifiCasePtr = 10;
+      //if(measureCount > 0 && retry != 0) {
+      if(upKeyPressed) {
+        upKeyPressed = false;
+        if(measureCount > 0){
+          measureIndex = measureCount-1;
+          wifiCasePtr = 10;
+        }
       }
 
       vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -616,13 +685,14 @@ void wifiConnectTask(void *parameter){
     case 10:{
       mqttServer.loop(); // Keep MQTT Alive
 
-      if(measureIndex > 0){
+      if(measureIndex > -1){
         PrintDebug(String("Pushing Measurement: ") + String(measureIndex), PRINT_WIFI_DEBUG);
         mqttReportMeasurement(measureIndex);
         startTimout(5);
         wifiCasePtr++;
       }
       else{
+        PrintDebug(String("DELETE FLASH"), PRINT_WIFI_DEBUG);
         deleteMeasuresFromFlash();
         newMeasurementsPushed = true;
         wifiCasePtr = 7;
@@ -720,6 +790,7 @@ void IotTask(void *parameter){
           {
             wheelTicksCount++;
             wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
+            wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
             PrintDebug("Forward:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
             newIotDataAvailable = true;
             casePtr = 0;
@@ -1069,7 +1140,7 @@ bool getKeypad(char *out, size_t outSize) {
         strncpy(out, src, outSize - 1);
         out[outSize - 1] = '\0';  // always terminate
 
-        if(strcmp(src, "7") == 0) return false; // REMOVE - FAULTY KEYPAD
+        if(strcmp(src, "4") == 0) return false; // REMOVE - FAULTY KEYPAD
 
         return true;
       }
@@ -1108,9 +1179,8 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
     // isPairing - Device ID Request
     if (_cmd == MQTT_CMD_REQ_MONITOR)
     {
-      if (isAdvertising)
+      if (isPairing)
       {
-
         MqttJsonDoc mqttPacket;
         
         mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -1131,14 +1201,35 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
     {
       androidConnected = true;
       connectedDeviceId = fromDeviceId;
-      strlcpy((char*)settingsIotType, _payloadJson[SETTING_IOT_TYPE].as<const char *>(), sizeof(settingsIotType));
 
+      const char* iotType = _payloadJson[JSON_IOT_TYPE];
+      if (iotType) strlcpy(settingsIotType, _payloadJson[JSON_IOT_TYPE].as<const char *>(), sizeof(settingsIotType));
+      else settingsIotType[0] = '\n';
+      
       // Wheel Data
-      if (settingsIotType == IOT_TYPE_WHEEL)
+      if (strcmp(settingsIotType,IOT_TYPE_WHEEL)==0)
       {
-        settingsTicksPerMeter = _payloadJson[SETTING_TICKS_PER_M].as<int32_t>();
+        strlcpy(settingsIotType, _payloadJson[JSON_IOT_TYPE].as<const char *>(), sizeof(settingsIotType));
+        settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
         wheelTicksCount = 0;
+
+        // IOT Monitor Doc ID
+        const char* monId = _payloadJson[JSON_MONITOR_DOC_ID];
+        if (monId)
+        {
+            strncpy(settingsMonDocId, monId, sizeof(settingsMonDocId) - 1);
+            settingsMonDocId[sizeof(settingsMonDocId) - 1] = '\0';  // ensure null termination
+        }
+
+        // User ID
+        const char* userId = _payloadJson[JSON_USER_ID];
+        if (userId)
+        {
+            strncpy(settingsUserId, userId, sizeof(settingsUserId) - 1);
+            settingsUserId[sizeof(settingsUserId) - 1] = '\0';  // ensure null termination
+        }
       }
+      else PrintDebug(String("IotType not found"), PRINT_GENERAL_DEBUG);
 
       // Send Confirmation MQTT
       MqttJsonDoc mqttPacket;
@@ -1150,6 +1241,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
       mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_CONNECT_MONITOR;
 
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+      newSettingsRecieved = true;
     }
 
     // DisConnection Requested
@@ -1259,31 +1351,24 @@ bool mqttReportMeasurement(int index){
   std::vector<Measure> measures;
   getAllMeasurements(measures);
 
-  //for (int i = 0; i < measures.size(); i++) {
-    PrintDebug(
-      (String("Push ") + FLASH_MEASURE_DATA + String(index) + ": " + 
-      String(JSON_SETTING_OPERATOR) + String(" ") + String(measures[index].nameOperator) + "," +
-      String(JSON_SETTING_FOREMAN) + String(" ") + String(measures[index].nameForeman) + "," +
-      String(JSON_SETTING_DISTANCE) + String(" ") + String(measures[index].distance) + "," +
-      String(JSON_SETTING_LINES) + String(" ") + String(measures[index].lines)) ,
-      PRINT_GENERAL_DEBUG);
-  //}
-    
   MqttJsonDoc mqttPacket;
-
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
   mqttPacket[MQTT_JSON_TO_DEVICE_ID] = connectedDeviceId;
   mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
   mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_MEASURE_DATA;
 
   // Payload Json
-   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
-   
-    payload[JSON_SETTING_OPERATOR] = measures[index].nameOperator;
-    payload[JSON_SETTING_FOREMAN]  = measures[index].nameForeman;
-    payload[JSON_SETTING_DISTANCE] = measures[index].distance;
-    payload[JSON_SETTING_LINES]    = measures[index].lines;
+  JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD); 
+  payload[JSON_SET_OPERATOR] = measures[index].nameOperator;
+  payload[JSON_SET_SUPERVISOR]  = measures[index].nameSupervisor;
+  payload[JSON_SET_DISTANCE] = measures[index].distance;
+  payload[JSON_SET_LINES]    = measures[index].lines;
+  payload[JSON_SET_TIMESTAMP]    = getTimeStamp();
   
+  payload[JSON_USER_ID] = settingsUserId;
+  payload[JSON_MONITOR_DOC_ID] = settingsMonDocId;
+  payload[JSON_IOT_TYPE] = settingsIotType;
+
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
   return true;
 }
@@ -1434,38 +1519,68 @@ void bt_StartAdvertising(){
 
 // Flash Read / Write
 void saveSettingsToFlash(){
-  noInterrupts();
+  char _iot[32];
+  char _uid[32];
+  char _monid[32];
+  
+  prefs.begin(FLASH_SETTINGS, false); // read-write
+  prefs.getString(FLASH_SET_IOT_TYPE, _iot, sizeof(settingsIotType));
+  prefs.getString(FLASH_SET_MONITOR_DOC_ID, _monid, sizeof(settingsMonDocId));
+  prefs.getString(FLASH_SET_USER_ID, _uid, sizeof(settingsUserId));
 
-  prefs.begin("iot", false); // read-write
-  prefs.putString(SETTING_IOT_TYPE, (char *)settingsIotType);
-  prefs.putInt(SETTING_TICKS_PER_M, settingsTicksPerMeter);
-  prefs.end();
-
-  interrupts();
+  if((strcmp(settingsMonDocId, _monid) == 0) &&
+    (strcmp(settingsUserId, _uid) == 0) &&
+    (strcmp(settingsIotType, _iot) == 0)){
+    
+    // Flash UpToDate
+    PrintDebug(String("FLASH UpToDate -  ") + 
+      FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
+      FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
+      FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
+      PRINT_FLASH_DEBUG);
+  }
+  else{
+    
+    // Save New
+    prefs.putString(FLASH_SET_IOT_TYPE, (char *)settingsIotType);
+    prefs.putString(FLASH_SET_MONITOR_DOC_ID, (char *)settingsMonDocId);
+    prefs.putString(FLASH_SET_USER_ID, (char *)settingsUserId);
+    prefs.putInt(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);
+    prefs.end();
+    
+    PrintDebug(String("SAVED to FLASH -  ") + 
+      FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
+      FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
+      FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
+      PRINT_FLASH_DEBUG);
+  }
 }
 void loadSettingsFromFlash(){
-  noInterrupts();
-  prefs.begin("iot", true); // read-only
+  prefs.begin(FLASH_SETTINGS, true); // read-only
 
-  String iot = prefs.getString(SETTING_IOT_TYPE, IOT_TYPE_WHEEL);
-  strlcpy((char *)settingsIotType, iot.c_str(), sizeof(settingsIotType));
+  prefs.getString(FLASH_SET_IOT_TYPE, settingsIotType, sizeof(settingsIotType));
+  prefs.getString(FLASH_SET_MONITOR_DOC_ID, settingsMonDocId, sizeof(settingsMonDocId));
+  prefs.getString(FLASH_SET_USER_ID, settingsUserId, sizeof(settingsUserId));
+  settingsTicksPerMeter = prefs.getInt(FLASH_SET_TICKS_PER_M, 20);
 
-  settingsTicksPerMeter = prefs.getInt(SETTING_TICKS_PER_M, 20);
-  PrintDebug(String("From FLASH - IOT Type: ") + settingsIotType, PRINT_GENERAL_DEBUG);
+  PrintDebug(String("From FLASH -  ") + 
+    FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
+    FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
+    FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
+    PRINT_FLASH_DEBUG);
 
   prefs.end();
-  interrupts();
 }
 void saveMeasureToFlash(Measure &measure){
   const String data = FLASH_MEASURE_DATA + String(measureCount++);
 
   PrintDebug(String("TO FLASH: ") + 
     FLASH_MEASURE_DATA + String(measureCount) + ","  +
-    measure.nameForeman + "," +  
+    measure.nameSupervisor + "," +  
     measure.nameOperator + "," + 
     String(measure.distance) + ","  +  
     String(measure.lines) , 
-    PRINT_GENERAL_DEBUG);
+    PRINT_FLASH_DEBUG);
 
   prefs.begin(FLASH_MEASURE_KEY, false);
   prefs.putBytes(data.c_str(), &measure, sizeof(measure));
@@ -1513,36 +1628,6 @@ void loadMeasureCountFromFlash(){
   size_t count = prefs.getUInt("count", 0);
   measureCount = count;
   PrintDebug(String("From FLASH - Measure Count: ") + measureCount, PRINT_GENERAL_DEBUG);
-  prefs.end();
-}
-
-void saveDistancesToNVM(int value){
-  prefs.begin("distances", false);
-
-  uint count = prefs.getUInt("count", 0);
-
-  String key = "n" + String(count);
-  prefs.putInt(key.c_str(), value);
-  prefs.putUInt("count", count + 1);
-  prefs.end();
-}
-void removeDistancesFromNVM(){
-  prefs.begin("distances", false);
-  prefs.clear();
-  prefs.end();
-}
-void loadDistancesFromNVM(std::vector<int> &nums){
-  prefs.begin("distances", true); // read-only
-
-  size_t count = prefs.getUInt("count", 0);
-  nums.clear();
-
-  for (size_t i = 0; i < count; i++)
-  {
-    String key = "n" + String(i);
-    nums.push_back(prefs.getInt(key.c_str(), 0));
-  }
-
   prefs.end();
 }
 
@@ -1612,7 +1697,7 @@ void setup(){
   xTaskCreatePinnedToCore(
       wifiConnectTask,        // Task function
       "ConnectWiFiTask",      // Task name
-      8000,                   // Stack size (bytes)
+      7000,                   // Stack size (bytes)
       NULL,                   // Parameters
       1,                      // Priority
       &ConnectWiFiTaskHandle, // Task handle
@@ -1622,7 +1707,7 @@ void setup(){
   xTaskCreatePinnedToCore(
       IotTask,        // Task function
       "IotTask",      // Task name
-      8000,          // Stack size (bytes)
+      7000,          // Stack size (bytes)
       NULL,           // Parameters
       1,              // Priority
       &IotTaskHandle, // Task handle
@@ -1677,16 +1762,17 @@ void loop(){
   }
   break;
 
-  // Home:
+  // Home: ----------------------------------------------------------------
   // - Wait for isPairing Button Press
-  // - Wait for Connection request
+  // - Wait for Connection request ----------------------------------------
   case 3: {
     // Keep MQTT Alive
     mqttServer.loop();
 
     // isPairing
-    if (isPairing)
+    if (startPairing)
     {
+      startPairing = false;
       mainCasePtr = CASE_PAIR;
       break;
     }
@@ -1698,7 +1784,13 @@ void loop(){
         mqttReportIotData();
       }
     }
-        
+    
+    // New Settings Recieved
+    if(newSettingsRecieved){
+      newSettingsRecieved = false;
+      saveSettingsToFlash();
+    }
+
     // startKeyPressed
     if (startKeyPressed)
     {
@@ -1709,16 +1801,17 @@ void loop(){
       PrintDebug("Start Wheel", PRINT_GENERAL_DEBUG);
     }
 
-    if(upKeyPressed){
-      upKeyPressed = false;
-    }
+    // if(upKeyPressed){
+    //   upKeyPressed = false;
+    // }
 
     // New Measurement
     if(newMeasurementsPushed){
-      newMeasurementsPushed = false;
-       writeLCD("Data Pushed", "");
-       startTimout(DISPLAY_TIMEOUT);
-       mainCasePtr++;
+      newMeasurementsPushed = false; 
+      loadMeasureCountFromFlash();
+      writeLCD("Data Pushed", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr++;
     }
 
     // Wifi Status
@@ -1727,6 +1820,7 @@ void loop(){
     }
     else{
       isWifiConnected = false;
+      isMqttServiceConnected = false;
     }
   }
   break;
@@ -1749,7 +1843,6 @@ void loop(){
     if (!isWifiConnected) {
         writeLCD("Pairing ...", "No WiFi");
         startTimout(DISPLAY_TIMEOUT);
-        isPairing = false;
         mainCasePtr = 12;
         break;
       }
@@ -1757,14 +1850,13 @@ void loop(){
     if (!mqttServer.connected()){
       writeLCD("Pairing ...", "No MQTT");
       startTimout(DISPLAY_TIMEOUT);
-      isPairing = false;
       mainCasePtr = 12;
       break;
     }
 
     writeLCD("Pairing...", "");
 
-    isAdvertising = true;
+    isPairing = true;
     androidConnected = false;
     startTimout(PAIR_TIMEOUT);  
     mainCasePtr++;  
@@ -1782,7 +1874,6 @@ void loop(){
       timerAlarmDisable(timer);
       digitalWrite(LED_MQTT_CONNECTED, HIGH);
 
-      isAdvertising = false;
       isPairing = false;
 
       PrintDebug("Monitor Found", PRINT_GENERAL_DEBUG);
@@ -1799,7 +1890,6 @@ void loop(){
       digitalWrite(LED_MQTT_CONNECTED, HIGH);
 
       btnPairPressed = false;
-      isAdvertising = false;
       isPairing = false;
       androidConnected = false;
 
@@ -1813,7 +1903,6 @@ void loop(){
     if (timeoutFlag)
     {
       timeoutFlag = false;
-      isAdvertising = false;
       isPairing = false;
       digitalWrite(LED_MQTT_CONNECTED, HIGH);
 
@@ -1836,13 +1925,16 @@ void loop(){
   }
   break;
   
+  // ---------------------------------------------------------------------
+  // Wheel
+  // ---------------------------------------------------------------------
   // (Wheel) Start - Present Tag
   case 20:
   {
     isRunning = true;
     nrOfLanesToCut[0] = '\0';
     laneIndex = 0;
-    writeLCD("Operator Tag", "");
+    writeLCD("Operator", "Tag");
     mainCasePtr++;
   }
   break;
@@ -1850,6 +1942,11 @@ void loop(){
   // (Wheel) Operator Tag
   case 21:
   {
+    if(backKeyPressed){
+      backKeyPressed = false;
+      mainCasePtr = CASE_HOME;
+    }
+
     if (startKeyPressed)
     {
       strncpy(thisMeasure.nameOperator, "Sipho Khumalo", sizeof(thisMeasure.nameOperator) - 1);
@@ -1887,6 +1984,12 @@ void loop(){
     {
       oldDistance = wheelDistance;
       writeLCD("Distance: " + String(wheelDistance) + "m", "");
+    }
+
+    // Cancell
+    if(backKeyPressed){
+      backKeyPressed = false;
+      mainCasePtr = CASE_HOME;
     }
 
     // Stop
@@ -1942,7 +2045,7 @@ void loop(){
       enterKeyPressed = false;
       thisMeasure.distance = wheelDistance;  
       thisMeasure.lines = strtol(nrOfLanesToCut, nullptr, 10);
-      writeLCD("Foreman Tag", "");
+      writeLCD("Supervisor", "Tag");
       mainCasePtr++;
     }
     
@@ -1968,15 +2071,19 @@ void loop(){
   }
   break;
 
-  // (Wheel) Foreman tag
+  // (Wheel) Surpervisor tag
   case 27:
   {
-    if (startKeyPressed)
-    {
+    if(backKeyPressed){
+      backKeyPressed = false;
+      mainCasePtr = 23;
+    }
+
+    if (startKeyPressed) {
       startKeyPressed = false;
    
-      strncpy(thisMeasure.nameForeman, "Marius Radyn", sizeof(thisMeasure.nameForeman) - 1);
-      writeLCD(thisMeasure.nameForeman, "");
+      strncpy(thisMeasure.nameSupervisor, "Marius Radyn", sizeof(thisMeasure.nameSupervisor) - 1);
+      writeLCD(thisMeasure.nameSupervisor, "");
       startTimout(3);
       mainCasePtr++;
     }
