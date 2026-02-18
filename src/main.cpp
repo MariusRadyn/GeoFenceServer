@@ -35,6 +35,8 @@ const int port = 8080;
 
 #define CASE_PAIR 10
 #define CASE_MEASURE_WHEEL 20
+#define CASE_LIVE_WHEEL_DATA 40
+#define CASE_DISPLAY_RETURN_HOME 4
 #define CASE_HOME 2
 
 constexpr const char *IOT_TYPE_VEHICLE = "Vehicle";
@@ -44,12 +46,14 @@ constexpr const char *IOT_TYPE_WHEEL = "Distance Wheel";
 
 // Flash Settings
 constexpr const char *FLASH_SET_TICKS_PER_M = "ticksPerM";
+constexpr const char *FLASH_SET_IOT_NAME = "iotName";
 constexpr const char *FLASH_SET_IOT_TYPE = "iotType";
-constexpr const char *FLASH_SET_USER_ID = "userId";
+constexpr const char *FLASH_SET_USER_DOC_ID = "userDocId";
 constexpr const char *FLASH_SET_MONITOR_DOC_ID = "monDocId";
 
 char settingsIotType[32] = {0};
-char settingsUserId[32] = {0};
+char settingsIotName[32] = {0};
+char settingsUserDocId[32] = {0};
 char settingsMonDocId[32] = {0};
 int32_t settingsTicksPerMeter = 0;
 
@@ -127,9 +131,10 @@ const String JSON_SET_DISTANCE = "distance";
 const String JSON_SET_LINES = "lines";  
 const String JSON_SET_TIMESTAMP = "timestamp";  
 const String JSON_SET_TICKS_PER_M = "ticksPerM";
-const String JSON_USER_ID = "userId";  
-const String JSON_MONITOR_DOC_ID = "docId";  
+const String JSON_USER_DOC_ID = "userDocId";  
+const String JSON_MONITOR_DOC_ID = "monDocId";  
 const String JSON_IOT_TYPE = "iotType";  
+const String JSON_IOT_NAME = "iotName";  
 
 // FLASH Data Structure
 struct Measure {
@@ -243,7 +248,6 @@ String connectedDeviceId;
 String myDeviceId;
 String fromDeviceId;
 String toDeviceId;
-bool newIotDataAvailable = false;
 bool newMeasurementsPushed = false;
 double wheelDistance = 0;
 double oldDistance = 0;
@@ -265,6 +269,7 @@ bool androidConnected = false;
 bool newSettingsRecieved = false;
 bool dataACK = false;
 bool isRunning = false;
+bool iotTypeError = false;
 
 // Battery
 int batteryLevel = 81; // Percentage
@@ -792,7 +797,6 @@ void IotTask(void *parameter){
             wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
             wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
             PrintDebug("Forward:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
-            newIotDataAvailable = true;
             casePtr = 0;
           }
           break;
@@ -829,7 +833,6 @@ void IotTask(void *parameter){
 
             wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
             PrintDebug("Reverse:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
-            newIotDataAvailable = true;
             casePtr = 0;
           }
         }
@@ -1061,12 +1064,12 @@ String loadPassword(){
   prefs.end();
   return pw;
 }
-void writeLCD(String line1, String line2, bool showCnt){
+void writeLCD(String line1, String line2, bool showLineCnt){
   lcd_i2c.clear();
   lcd_i2c.setCursor(0, 0);
   
   // Insert Measurement Counts
-  if(showCnt){
+  if(showLineCnt){
     String cnt = String(" (") + String(measureCount) + ")";
   
     if (line1.length() > 16 - cnt.length())
@@ -1173,14 +1176,26 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
   JsonVariant _payloadVar = doc[MQTT_JSON_PAYLOAD];
   JsonObject _payloadJson = _payloadVar.as<JsonObject>();
 
+  // -------------------------------------------
   // Broadcast RX
+  // -------------------------------------------
   if (_topic == MQTT_TOPIC_TO_IOT)
   {
-    // isPairing - Device ID Request
+    // Pair - Device ID Request
     if (_cmd == MQTT_CMD_REQ_MONITOR)
     {
       if (isPairing)
       {
+        // IOT Type
+        const char* iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
+        if(!iotType)return;
+
+        if (strcmp(iotType,IOT_TYPE_WHEEL)!=0) {
+          iotTypeError = true;
+          PrintDebug(String("IotType (Distance Wheel) Mismatch: ") + String(iotType), PRINT_GENERAL_DEBUG);
+          return;
+        }
+
         MqttJsonDoc mqttPacket;
         
         mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -1193,43 +1208,18 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
     }
   }
 
+
+  // -------------------------------------------
   // Private RX
+  // -------------------------------------------
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId)
   {
-    // Connection Requested
+    // Live Connection Requested
     if (_cmd == MQTT_CMD_CONNECT_MONITOR)
     {
       androidConnected = true;
       connectedDeviceId = fromDeviceId;
-
-      const char* iotType = _payloadJson[JSON_IOT_TYPE];
-      if (iotType) strlcpy(settingsIotType, _payloadJson[JSON_IOT_TYPE].as<const char *>(), sizeof(settingsIotType));
-      else settingsIotType[0] = '\n';
-      
-      // Wheel Data
-      if (strcmp(settingsIotType,IOT_TYPE_WHEEL)==0)
-      {
-        strlcpy(settingsIotType, _payloadJson[JSON_IOT_TYPE].as<const char *>(), sizeof(settingsIotType));
-        settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
-        wheelTicksCount = 0;
-
-        // IOT Monitor Doc ID
-        const char* monId = _payloadJson[JSON_MONITOR_DOC_ID];
-        if (monId)
-        {
-            strncpy(settingsMonDocId, monId, sizeof(settingsMonDocId) - 1);
-            settingsMonDocId[sizeof(settingsMonDocId) - 1] = '\0';  // ensure null termination
-        }
-
-        // User ID
-        const char* userId = _payloadJson[JSON_USER_ID];
-        if (userId)
-        {
-            strncpy(settingsUserId, userId, sizeof(settingsUserId) - 1);
-            settingsUserId[sizeof(settingsUserId) - 1] = '\0';  // ensure null termination
-        }
-      }
-      else PrintDebug(String("IotType not found"), PRINT_GENERAL_DEBUG);
+      wheelTicksCount = 0;
 
       // Send Confirmation MQTT
       MqttJsonDoc mqttPacket;
@@ -1241,7 +1231,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
       mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_CONNECT_MONITOR;
 
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-      newSettingsRecieved = true;
+      
     }
 
     // DisConnection Requested
@@ -1262,9 +1252,36 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
     }
 
-    // Monitor Found (ACK)
+    // Pair DONE (ACK) (Save Settings to FLASH)
     if (_cmd == MQTT_CMD_FOUND_MONITOR)
     {
+      // iotType
+      const char* iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
+      if (iotType) strlcpy(settingsIotType, iotType, sizeof(settingsIotType));
+      else settingsIotType[0] = '\n';
+
+      // Ticks per Meter
+      settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
+
+      // IOT Name
+      const char* iotName = _payloadJson[JSON_IOT_NAME].as<const char *>();
+      if (iotName) strlcpy(settingsIotName, iotName, sizeof(settingsIotName));
+      else settingsIotName[0] = '\n';
+
+      // IOT Monitor Doc ID
+      const char* monId = _payloadJson[JSON_MONITOR_DOC_ID];
+      if (monId) {
+          strncpy(settingsMonDocId, monId, sizeof(settingsMonDocId) - 1);
+          settingsMonDocId[sizeof(settingsMonDocId) - 1] = '\0';  // ensure null termination
+      }
+
+      // User Doc ID
+      const char* userId = _payloadJson[JSON_USER_DOC_ID];
+      if (userId) {
+          strncpy(settingsUserDocId, userId, sizeof(settingsUserDocId) - 1);
+          settingsUserDocId[sizeof(settingsUserDocId) - 1] = '\0';  // ensure null termination
+      }
+      
       MqttJsonDoc mqttPacket;
 
       mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -1273,6 +1290,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
       mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_FOUND_MONITOR;
 
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+      newSettingsRecieved = true;
     }
 
     // Measure Data (ACK)
@@ -1365,9 +1383,10 @@ bool mqttReportMeasurement(int index){
   payload[JSON_SET_LINES]    = measures[index].lines;
   payload[JSON_SET_TIMESTAMP]    = getTimeStamp();
   
-  payload[JSON_USER_ID] = settingsUserId;
+  payload[JSON_USER_DOC_ID] = settingsUserDocId;
   payload[JSON_MONITOR_DOC_ID] = settingsMonDocId;
   payload[JSON_IOT_TYPE] = settingsIotType;
+  payload[JSON_IOT_NAME] = settingsIotName;
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
   return true;
@@ -1519,53 +1538,51 @@ void bt_StartAdvertising(){
 
 // Flash Read / Write
 void saveSettingsToFlash(){
-  char _iot[32];
+  char _iotType[32];
+  char _iotName[32];
   char _uid[32];
   char _monid[32];
+  int _ticks = 0;
   
   prefs.begin(FLASH_SETTINGS, false); // read-write
-  prefs.getString(FLASH_SET_IOT_TYPE, _iot, sizeof(settingsIotType));
+  
+  prefs.getString(FLASH_SET_IOT_NAME, _iotName, sizeof(settingsIotName));
+  prefs.getString(FLASH_SET_IOT_TYPE, _iotType, sizeof(settingsIotType));
   prefs.getString(FLASH_SET_MONITOR_DOC_ID, _monid, sizeof(settingsMonDocId));
-  prefs.getString(FLASH_SET_USER_ID, _uid, sizeof(settingsUserId));
+  prefs.getString(FLASH_SET_USER_DOC_ID, _uid, sizeof(settingsUserDocId));
+  prefs.getInt(FLASH_SET_TICKS_PER_M, _ticks);
 
-  if((strcmp(settingsMonDocId, _monid) == 0) &&
-    (strcmp(settingsUserId, _uid) == 0) &&
-    (strcmp(settingsIotType, _iot) == 0)){
+  // Save New
+  if(strcmp(settingsMonDocId, _monid) != 0){prefs.putString(FLASH_SET_MONITOR_DOC_ID, (char *)settingsMonDocId);}
+  if(strcmp(settingsUserDocId, _uid) != 0) {prefs.putString(FLASH_SET_USER_DOC_ID, (char *)settingsUserDocId);}
+  if(strcmp(settingsIotType, _iotType) != 0) {prefs.putString(FLASH_SET_IOT_TYPE, (char *)settingsIotType);}
+  if(strcmp(settingsIotName, _iotName) != 0) {prefs.putString(FLASH_SET_IOT_NAME, (char *)settingsIotName);}
+  if(settingsTicksPerMeter != _ticks){prefs.putInt(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);}
+
+  prefs.end();
     
-    // Flash UpToDate
-    PrintDebug(String("FLASH UpToDate -  ") + 
-      FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
-      FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
-      FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
-      PRINT_FLASH_DEBUG);
-  }
-  else{
-    
-    // Save New
-    prefs.putString(FLASH_SET_IOT_TYPE, (char *)settingsIotType);
-    prefs.putString(FLASH_SET_MONITOR_DOC_ID, (char *)settingsMonDocId);
-    prefs.putString(FLASH_SET_USER_ID, (char *)settingsUserId);
-    prefs.putInt(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);
-    prefs.end();
-    
-    PrintDebug(String("SAVED to FLASH -  ") + 
-      FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
-      FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
-      FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
-      PRINT_FLASH_DEBUG);
-  }
+  PrintDebug(String("FLASH: ") + 
+    FLASH_SET_IOT_NAME + String(": ") +  settingsIotName + ", " +
+    FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
+    FLASH_SET_USER_DOC_ID + String(": ") + settingsUserDocId + ", " +
+    FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId + ", " +
+    FLASH_SET_TICKS_PER_M + String(": ") + settingsTicksPerMeter,
+    PRINT_FLASH_DEBUG);
+
 }
 void loadSettingsFromFlash(){
   prefs.begin(FLASH_SETTINGS, true); // read-only
 
+  prefs.getString(FLASH_SET_IOT_NAME, settingsIotName, sizeof(settingsIotName));
   prefs.getString(FLASH_SET_IOT_TYPE, settingsIotType, sizeof(settingsIotType));
   prefs.getString(FLASH_SET_MONITOR_DOC_ID, settingsMonDocId, sizeof(settingsMonDocId));
-  prefs.getString(FLASH_SET_USER_ID, settingsUserId, sizeof(settingsUserId));
+  prefs.getString(FLASH_SET_USER_DOC_ID, settingsUserDocId, sizeof(settingsUserDocId));
   settingsTicksPerMeter = prefs.getInt(FLASH_SET_TICKS_PER_M, 20);
 
   PrintDebug(String("From FLASH -  ") + 
+    FLASH_SET_IOT_NAME + String(": ") +  settingsIotName + ", " +
     FLASH_SET_IOT_TYPE + String(": ") +  settingsIotType + ", " +
-    FLASH_SET_USER_ID + String(": ") + settingsUserId + ", " +
+    FLASH_SET_USER_DOC_ID + String(": ") + settingsUserDocId + ", " +
     FLASH_SET_MONITOR_DOC_ID + String(": ") + settingsMonDocId,
     PRINT_FLASH_DEBUG);
 
@@ -1758,6 +1775,9 @@ void loop(){
   case 2:
   {
     writeLCD("Ready", "Press Start", true);
+    oldDistance = 0;
+    wheelDistance = 0;
+    isRunning = 0;
     mainCasePtr++;
   }
   break;
@@ -1779,16 +1799,25 @@ void loop(){
 
     // TX Live Data
     if (androidConnected) {
-      if (newIotDataAvailable) {
-        newIotDataAvailable = false;
-        mqttReportIotData();
-      }
+      mainCasePtr = CASE_LIVE_WHEEL_DATA;
+      break;
     }
     
     // New Settings Recieved
-    if(newSettingsRecieved){
+    if (newSettingsRecieved) {
       newSettingsRecieved = false;
       saveSettingsToFlash();
+      writeLCD("Settings Saved", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+    }
+
+    // IOT Type Error
+    if(iotTypeError){
+      iotTypeError = false;
+      writeLCD("IOT Type Mismatch", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
     }
 
     // startKeyPressed
@@ -1825,8 +1854,9 @@ void loop(){
   }
   break;
 
+  // Display Delay - Return Home
   case 4: {
-    // Display Delay - Return Home
+   
     if (timeoutFlag)
     {
       timeoutFlag = false;
@@ -1835,7 +1865,9 @@ void loop(){
   }
   break;
   
-  // (isPairing) Start 
+  // ----------------------------------------
+  // (Pairing) Start 
+  // ----------------------------------------
   case 10: {
     // Keep MQTT Alive
     mqttServer.loop();
@@ -1925,9 +1957,10 @@ void loop(){
   }
   break;
   
-  // ---------------------------------------------------------------------
+  // ----------------------------------------
   // Wheel
-  // ---------------------------------------------------------------------
+  // ----------------------------------------
+  
   // (Wheel) Start - Present Tag
   case 20:
   {
@@ -1965,7 +1998,7 @@ void loop(){
   }
   break;
 
-    // (Wheel) Go
+  // (Wheel) Go
   case 23:
   {
     if (timeoutFlag)
@@ -2114,6 +2147,40 @@ void loop(){
   }
   break;
 
+  // ----------------------------------------
+  // Live Data
+  // ----------------------------------------
+  case 40:{
+    writeLCD("Distance: " + String(wheelDistance) + "m", "Live");
+    isRunning = true;
+    oldDistance = 0;
+    wheelDistance = 0;
+    mainCasePtr++;
+  }
+  break;
+  
+  case 41:{
+    if(backKeyPressed){
+      backKeyPressed = false;
+      isRunning = false;
+      mainCasePtr = CASE_HOME;
+    }
+
+    // Wheel Moved
+    if (oldDistance != wheelDistance)
+    {
+      oldDistance = wheelDistance;
+      writeLCD("Distance: " + String(wheelDistance) + "m", "Live");
+      mqttReportIotData();
+    }
+
+    // Android Disconnected
+    if (!androidConnected) {
+        mainCasePtr = CASE_HOME;
+    }
+  }
+  break;
+  
   default:
     break;
   }
