@@ -132,7 +132,7 @@ const String JSON_SET_LINES = "lines";
 const String JSON_SET_TIMESTAMP = "timestamp";  
 const String JSON_SET_TICKS_PER_M = "ticksPerM";
 const String JSON_USER_DOC_ID = "userDocId";  
-const String JSON_MONITOR_DOC_ID = "monDocId";  
+const String JSON_MON_DOC_ID = "monDocId";  
 const String JSON_IOT_TYPE = "iotType";  
 const String JSON_IOT_NAME = "iotName";  
 
@@ -309,7 +309,7 @@ bool loadMeasureFromFlash(const char* key, Measure &out);
 void loadMeasureCountFromFlash();
 void deleteMeasuresFromFlash();
 void mqttReportMyID();
-bool mqttReportMeasurement(int);
+bool mqttPushIotData(int);
 void getAllMeasurements(std::vector<Measure> &data);
 bool wifiCredentialsExist();
 
@@ -692,13 +692,13 @@ void wifiConnectTask(void *parameter){
 
       if(measureIndex > -1){
         PrintDebug(String("Pushing Measurement: ") + String(measureIndex), PRINT_WIFI_DEBUG);
-        mqttReportMeasurement(measureIndex);
+        mqttPushIotData(measureIndex);
         startTimout(5);
         wifiCasePtr++;
       }
       else{
         PrintDebug(String("DELETE FLASH"), PRINT_WIFI_DEBUG);
-        deleteMeasuresFromFlash();
+        //deleteMeasuresFromFlash();
         newMeasurementsPushed = true;
         wifiCasePtr = 7;
       }
@@ -1269,7 +1269,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length){
       else settingsIotName[0] = '\n';
 
       // IOT Monitor Doc ID
-      const char* monId = _payloadJson[JSON_MONITOR_DOC_ID];
+      const char* monId = _payloadJson[JSON_MON_DOC_ID];
       if (monId) {
           strncpy(settingsMonDocId, monId, sizeof(settingsMonDocId) - 1);
           settingsMonDocId[sizeof(settingsMonDocId) - 1] = '\0';  // ensure null termination
@@ -1340,7 +1340,7 @@ void mqttTX(const JsonDocument &msg, const String &topic)
     Serial.println("MQTT publish failed");
     }
 }
-void mqttReportIotData(){
+void mqttReportLiveIotData(){
   MqttJsonDoc mqttPacket;
 
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -1365,7 +1365,7 @@ void mqttReportMyID(){
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
-bool mqttReportMeasurement(int index){
+bool mqttPushIotData(int index){
   std::vector<Measure> measures;
   getAllMeasurements(measures);
 
@@ -1377,14 +1377,15 @@ bool mqttReportMeasurement(int index){
 
   // Payload Json
   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD); 
+
+  payload[JSON_SET_DISTANCE] =  roundf(measures[index].distance * 100.0f) / 100.0f;
   payload[JSON_SET_OPERATOR] = measures[index].nameOperator;
   payload[JSON_SET_SUPERVISOR]  = measures[index].nameSupervisor;
-  payload[JSON_SET_DISTANCE] = measures[index].distance;
   payload[JSON_SET_LINES]    = measures[index].lines;
   payload[JSON_SET_TIMESTAMP]    = getTimeStamp();
   
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
-  payload[JSON_MONITOR_DOC_ID] = settingsMonDocId;
+  payload[JSON_MON_DOC_ID] = settingsMonDocId;
   payload[JSON_IOT_TYPE] = settingsIotType;
   payload[JSON_IOT_NAME] = settingsIotName;
 
@@ -2171,7 +2172,7 @@ void loop(){
     {
       oldDistance = wheelDistance;
       writeLCD("Distance: " + String(wheelDistance) + "m", "Live");
-      mqttReportIotData();
+      mqttReportLiveIotData();
     }
 
     // Android Disconnected
