@@ -164,13 +164,14 @@ using MqttJsonDoc = StaticJsonDocument<
 >;
 
 // IO
-#define BUT_PAIR 20           // BT isPairing button
-#define SENSOR_WHEEL_1 19     // Wheel distance sensor1
-#define SENSOR_WHEEL_2 5      // Wheel distance sensor2
+#define BATTERY_VIN 36        // Battery Analog Voltage
+#define TAG 34                // Tag Reader
+#define BUZZER 35             // Buzzer
+#define SENSOR_WHEEL_1 25     // Wheel distance sensor1
+#define SENSOR_WHEEL_2 26     // Wheel distance sensor2
 #define LED_BLUETOOTH 27      // Blue
-#define LED_WIFI_CONNECTED 12 // Red
-#define LED_MQTT_CONNECTED 14 // Green
-#define BUZZER 23             // Buzzer
+#define LED_WIFI_CONNECTED 14 // Red
+#define LED_MQTT_CONNECTED 12 // Green
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -179,10 +180,10 @@ using MqttJsonDoc = StaticJsonDocument<
 #define KEY_COL2 0
 #define KEY_COL3 4 
 #define KEY_COL4 16
-#define KEY_ROW1 26
-#define KEY_ROW2 25
-#define KEY_ROW3 33
-#define KEY_ROW4 15
+#define KEY_ROW1 17
+#define KEY_ROW2 5
+#define KEY_ROW3 18
+#define KEY_ROW4 19
 
 // LCD
 LiquidCrystal_I2C lcd_i2c(0x27, 16, 2); // I2C address 0x27, 16 column and 2 rows
@@ -198,10 +199,10 @@ int colPins[COLS] = {KEY_COL1, KEY_COL2, KEY_COL3, KEY_COL4};
 // Pinout:          26,25,33,15,16,04,00,02
 
 const char* keys[ROWS][COLS] = {
-  {"1","2","3","Up"},
-  {"4","5","6","Down"},
-  {"7","8","9","Back"},
-  {"Start","0","Stop","Enter"}
+  {"1","2","3","Enter"},
+  {"4","5","6","Back"},
+  {"7","8","9","Up"},
+  {"0","Start","Stop","Down"}
 };
 
 #define KEY_0 "0"
@@ -381,10 +382,6 @@ void startTimout(int seconds)
 }
 
 // Interrupts
-void IRAM_ATTR buttonISR()
-{
-  debPairFallEdge = true;
-}
 void IRAM_ATTR wheelSensor1ISR()
 {
   debWheel1FallEdge = true;
@@ -506,7 +503,7 @@ void GeneralTask(void *parameter)
       else if (strcmp(key, KEY_UP) == 0)  upKeyPressed = true;
       else if (strcmp(key, KEY_DOWN) == 0)  downKeyPressed = true;
       
-      // Stop / Pair
+      // Stop / Pair (Press STOP x 5)
       else if (strcmp(key, KEY_STOP) == 0){
         stopKeyPressed = true;
 
@@ -515,7 +512,7 @@ void GeneralTask(void *parameter)
             startTimout(5); // 5 seconds to enter isPairing mode
           }
 
-          if (++pairModePressCount >= PAIR_MODE_PRESS_COUNT){
+          if (pairModePressCount++ >= PAIR_MODE_PRESS_COUNT){
             pairModePressCount = 0;
             PrintDebug("Pairing MODE", PRINT_GENERAL_DEBUG);
             startPairing = true;
@@ -1143,8 +1140,6 @@ bool getKeypad(char *out, size_t outSize) {
         strncpy(out, src, outSize - 1);
         out[outSize - 1] = '\0';  // always terminate
 
-        if(strcmp(src, "4") == 0) return false; // REMOVE - FAULTY KEYPAD
-
         return true;
       }
     }
@@ -1656,8 +1651,10 @@ void setup(){
   pinMode(LED_BLUETOOTH, OUTPUT);
   pinMode(LED_WIFI_CONNECTED, OUTPUT);
   pinMode(LED_MQTT_CONNECTED, OUTPUT);
-  pinMode(BUT_PAIR, INPUT_PULLUP);
-  pinMode(SENSOR_WHEEL_1, INPUT_PULLUP);
+  pinMode(BATTERY_VIN, INPUT_PULLUP);
+  pinMode(TAG, INPUT_PULLUP);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(SENSOR_WHEEL_1, INPUT_PULLUP);  
   pinMode(SENSOR_WHEEL_2, INPUT_PULLUP);
   pinMode(KEY_ROW1, OUTPUT);
   pinMode(KEY_ROW2, OUTPUT);
@@ -1667,6 +1664,8 @@ void setup(){
   pinMode(KEY_COL2, INPUT_PULLUP);
   pinMode(KEY_COL3, INPUT_PULLUP);
   pinMode(KEY_COL4, INPUT_PULLUP);
+
+  digitalWrite(BUZZER, LOW);
 
   myDeviceId = getDeviceName();
 
@@ -1678,12 +1677,7 @@ void setup(){
   timerAlarmWrite(timer, 1000000, true);
   timerAlarmDisable(timer);
 
-  // Button Interrupt
-  attachInterrupt(
-      digitalPinToInterrupt(BUT_PAIR),
-      buttonISR,
-      FALLING);
-
+  
   // Wheel Sensor 1 Interrupt
   attachInterrupt(
       digitalPinToInterrupt(SENSOR_WHEEL_1),
@@ -1694,12 +1688,6 @@ void setup(){
   attachInterrupt(
       digitalPinToInterrupt(SENSOR_WHEEL_2),
       wheelSensor2ISR,
-      FALLING);
-
-  // Button Interrupt
-  attachInterrupt(
-      digitalPinToInterrupt(BUT_PAIR),
-      buttonISR,
       FALLING);
 
   xTaskCreatePinnedToCore(
