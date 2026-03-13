@@ -10,6 +10,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include "time.h"
+#include <OneWire.h>
 
 const String VERSION = "V1.0";
 
@@ -165,8 +166,9 @@ using MqttJsonDoc = StaticJsonDocument<
 
 // IO
 #define BATTERY_VIN 36        // Battery Analog Voltage
-#define TAG 34                // Tag Reader
-#define BUZZER 35             // Buzzer
+#define TAG_READER 34         // Tag Reader
+#define TAG_LED 33            // Tag Reader LED
+#define BUZZER 32             // Buzzer
 #define SENSOR_WHEEL_1 25     // Wheel distance sensor1
 #define SENSOR_WHEEL_2 26     // Wheel distance sensor2
 #define LED_BLUETOOTH 27      // Blue
@@ -184,6 +186,13 @@ using MqttJsonDoc = StaticJsonDocument<
 #define KEY_ROW2 5
 #define KEY_ROW3 18
 #define KEY_ROW4 19
+
+#define ADC_BATTERY 36
+
+
+// Dallas Tag
+OneWire dsTag(TAG_READER);
+byte adrTag[8];
 
 // LCD
 LiquidCrystal_I2C lcd_i2c(0x27, 16, 2); // I2C address 0x27, 16 column and 2 rows
@@ -271,9 +280,10 @@ bool newSettingsRecieved = false;
 bool dataACK = false;
 bool isRunning = false;
 bool iotTypeError = false;
+bool getFirstBatReading = true;
 
 // Battery
-int batteryLevel = 81; // Percentage
+int batteryLevel = 0; // Percentage
 
 // Debug
 const bool PRINT_ERRORS = true;
@@ -398,7 +408,11 @@ void GeneralTask(void *parameter)
   int step = 0;
   bool startup = true;
   int cntAdvertising = 0;
-
+  int tagReadDelay = 0;
+  int tagLedDelay = 0;
+  int batReadDelay = 0;
+  
+  bool ledTagState = LOW;
   bool ledState = LOW;
   bool ledWifiState = LOW;
   bool ledMqttState = LOW;
@@ -525,6 +539,52 @@ void GeneralTask(void *parameter)
 
     }
     
+    // Tag Reader
+    if(tagReadDelay++ >= 250){
+      tagReadDelay = 0;
+    
+      if (!dsTag.search(adrTag)) {
+        dsTag.reset_search();
+      }
+      else {
+        Serial.print("iButton ID: ");
+
+        for (int i = 0; i < 8; i++) {
+          if (adrTag[i] < 16) Serial.print("0");
+          Serial.print(adrTag[i], HEX);
+          Serial.print(" ");
+        }
+      }
+    }
+
+    // Tag LED Blink
+    if(tagLedDelay == 0){
+      if(ledTagState){
+        // Off time
+        tagLedDelay = 2000;
+        ledTagState = LOW;
+        digitalWrite(TAG_LED, LOW);
+      }
+      else{
+         // On time
+        tagLedDelay = 50;
+        ledTagState = HIGH;
+        digitalWrite(TAG_LED, HIGH);
+      }
+    }
+    else{
+      tagLedDelay--;
+    }
+
+    // Read Battery Voltage
+    if(batReadDelay++ >= 30000 || getFirstBatReading){ // Every 30 seconds or first reading
+      getFirstBatReading = false;
+      batReadDelay = 0;
+      int adcValue = analogRead(ADC_BATTERY);
+      batteryLevel = map(adcValue, 0, 1800, 0, 100); // Assuming a 12-bit ADC (1800 Max count)
+      PrintDebug("Battery Level: " + String(adcValue) + " (" + String(batteryLevel) + "%)", PRINT_GENERAL_DEBUG);
+    }
+
     vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
@@ -1652,7 +1712,8 @@ void setup(){
   pinMode(LED_WIFI_CONNECTED, OUTPUT);
   pinMode(LED_MQTT_CONNECTED, OUTPUT);
   pinMode(BATTERY_VIN, INPUT_PULLUP);
-  pinMode(TAG, INPUT_PULLUP);
+  pinMode(TAG_READER, INPUT);
+  pinMode(TAG_LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(SENSOR_WHEEL_1, INPUT_PULLUP);  
   pinMode(SENSOR_WHEEL_2, INPUT_PULLUP);
@@ -1665,7 +1726,12 @@ void setup(){
   pinMode(KEY_COL3, INPUT_PULLUP);
   pinMode(KEY_COL4, INPUT_PULLUP);
 
+  // Until board is fixed
+  pinMode(39, INPUT);
+  pinMode(35, INPUT);
+
   digitalWrite(BUZZER, LOW);
+  digitalWrite(TAG_LED, HIGH);
 
   myDeviceId = getDeviceName();
 
