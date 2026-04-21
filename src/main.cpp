@@ -53,6 +53,10 @@ constexpr const char *FLASH_SET_IOT_NAME = "iotName";
 constexpr const char *FLASH_SET_IOT_TYPE = "iotType";
 constexpr const char *FLASH_SET_USER_DOC_ID = "userDocId";
 constexpr const char *FLASH_SET_MONITOR_DOC_ID = "monDocId";
+constexpr const char *FLASH_SET_SSID = "ssid";
+constexpr const char *FLASH_SET_PASSWORD = "pw";
+constexpr const char *FLASH_SET_IP = "ip";
+
 
 char settingsIotType[32] = {0};
 char settingsIotName[32] = {0};
@@ -68,6 +72,7 @@ bool isMqttServiceConnected = false;
 bool isRPiConnectingBusy = false;
 bool isRPiConnected = false;
 bool gotWifiCredentials = false;
+bool gotPing = false;
 int wheelTicksCount = 0;
 
 // Commands
@@ -99,14 +104,17 @@ bool wheelSensor2Low = false;
 
 // MQTT Command
 constexpr size_t JSON_MAX_CMD = 32; // MAX Len
-const String MQTT_CMD_REQ_MONITOR = "#REQ_MONITOR";
+const String MQTT_CMD_DISCOVER = "#REQ_MONITOR";
 const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
 const String MQTT_CMD_CONNECT_MONITOR = "#CONNECT_MONITOR";
 const String MQTT_CMD_DISCONNECT_MONITOR = "#DISCONNECT_MONITOR";
 const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
 const String MQTT_CMD_ACK = "#ACK";
-const String MQTT_CMD_MONITOR_DATA = "#MONITOR_DATA";
+const String MQTT_CMD_PING = "#PING";
+const String MQTT_CMD_TAG_DATA = "#TAG_DATA";
+const String MQTT_CMD_LIVE_MONITOR_DATA = "#MONITOR_DATA";
 const String MQTT_CMD_MEASURE_DATA = "#MEASURE_DATA";
+const String MQTT_CMD_SETTINGS = "#REQ_SETTINGS";
 
 // MQTT Topics
 constexpr size_t JSON_MAX_TOPIC = 32; // MAX Len
@@ -127,6 +135,7 @@ const String MQTT_JSON_CMD = "cmd";
 const String MQTT_JSON_WHEEL_DISTANCE = "wheel_distance";
 const String MQTT_JSON_MEASUREMENTS = "measurements";
 const String MQTT_JSON_DATA = "data";
+const String MQTT_JSON_TAG_DATA = "tag_data";
 
 const String JSON_SET_OPERATOR = "operator";
 const String JSON_SET_SUPERVISOR = "supervisor";
@@ -160,6 +169,7 @@ int8_t readingsIndex = 0;
 const char *FLASH_READINGS_KEY = "readings";
 const char *FLASH_READINGS_DATA = "data";
 const char *FLASH_SETTINGS = "settings";
+const char *FLASH_WIFI_CRED = "wifi";
 
 #define MQTT_PAYLOAD_MAX 512
 using MqttJsonDoc = StaticJsonDocument<
@@ -286,7 +296,7 @@ bool downKeyPressed = false;
 bool newNumKeyPressed = false;
 bool startPairing = false;
 bool btConnected = false;
-bool wifiConnected = false;
+//bool isWifiConnected = false;
 bool isPairing = false;
 bool androidConnected = false;
 bool newSettingsRecieved = false;
@@ -326,11 +336,14 @@ void writeLCD(String line1, String line2);
 void writeLCD(String line1, String line2, bool cnt);
 bool getKeypad(char *out, size_t outSize);
 void saveDistancesToNVM(int value);
-void saveWifiCredentials(String ssid, String password, String ip);
+void saveWifiCredToFlash(String ssid, String password, String ip);
+void mqttPing();
+void loadWifiCredFromFlash();
+
 void removeDistancesFromNVM();
 void loadDistancesFromNVM(std::vector<int> &nums);
 bool loadReadingsFromFlash(const char *key, Readings &out);
-void loadReadungsCountFromFlash();
+void loadReadingsCountFromFlash();
 void deleteReadingsFromFlash();
 void mqttReportMyID();
 bool mqttPushIotData(int);
@@ -643,7 +656,8 @@ void GeneralTask(void *parameter)
       getFirstBatReading = false;
       batReadDelay = 0;
       int adcValue = analogRead(ADC_BATTERY);
-      batteryLevel = map(adcValue, 0, 1800, 0, 100); // Assuming a 12-bit ADC (1800 Max count)
+      batteryLevel = map(adcValue, 0, 3800, 0, 100); // Assuming a 12-bit ADC (3800 Max count)
+      if(batteryLevel > 100) batteryLevel = 100; // Cap at 100%
       PrintDebug("Battery Level: " + String(adcValue) + " (" + String(batteryLevel) + "%)", PRINT_GENERAL_DEBUG);
     }
 
@@ -666,9 +680,8 @@ void wifiConnectTask(void *parameter)
 
     switch (wifiCasePtr)
     {
-      // Start Bluetooth
-    case 0:
-    {
+      // Start Bluetooth and Wifi
+    case 0:{
       PrintDebug("Starting Bluetooth Connection", PRINT_WIFI_DEBUG);
 
       isBluetoothConnected = false;
@@ -677,8 +690,15 @@ void wifiConnectTask(void *parameter)
       gotWifiCredentials = false;
       showMsgOnce = true;
 
+      loadWifiCredFromFlash();
+      if(!password.isEmpty() && !ssid.isEmpty()){
+        WiFi.begin(ssid, password);
+        PrintDebug("Start Wifi ", PRINT_WIFI_DEBUG);
+      }
+
       bt_StartServer();
       bt_StartAdvertising();
+      startTimout(5);
       wifiCasePtr++;
     }
     break;
@@ -692,6 +712,11 @@ void wifiConnectTask(void *parameter)
         PrintDebug("Waiting for Wifi Credentials ... ", PRINT_WIFI_DEBUG);
         wifiCasePtr++;
       }
+      if(timeoutFlag){
+        if (WiFi.status() == WL_CONNECTED){
+          wifiCasePtr = 4; // Skip Bluetooth if already connected to WiFi
+        }
+      }
     }
     break;
 
@@ -702,9 +727,7 @@ void wifiConnectTask(void *parameter)
       {
         // Start WiFi Connection
         isWifiConnected = false;
-        isMqttServiceConnected = false;
-
-        saveWifiCredentials(ssid, password, serverIP);
+        isMqttServiceConnected = false; 
         wifiCasePtr++;
       }
     }
@@ -750,7 +773,6 @@ void wifiConnectTask(void *parameter)
       {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
 
-        isMqttServiceConnected = true;
         mqttServer.loop();
         digitalWrite(LED_MQTT_CONNECTED, HIGH); // Green
         mqttReportMyID();
@@ -778,13 +800,50 @@ void wifiConnectTask(void *parameter)
       PrintDebug((String("MQTT Subscribe ...") + MQTT_TOPIC_TO_IOT_PRIVATE.c_str()), PRINT_WIFI_DEBUG);
 
       Serial.printf("%s Stack free: %u bytes\n", pcTaskGetName(NULL), uxTaskGetStackHighWaterMark(ConnectWiFiTaskHandle));
-      retry = 3; // Push Data Retry in next
+      retry = 3; // Ping Retry
+      wifiCasePtr++;
+    }
+    break;
+
+    // Ping Base Station
+    case 7:
+    {
+      mqttPing();
+      startTimout(2);
+      wifiCasePtr++;
+    }
+    break;
+
+    // Wait Base Response
+    case 8:
+    {
+      if(gotPing)
+      {
+        PrintDebug("PING ACK", PRINT_WIFI_DEBUG);
+        gotPing = false;
+        isMqttServiceConnected = true;
+        wifiCasePtr = 9; // Connection OK
+      }
+      else if(timeoutFlag)
+      {
+        PrintDebug("PING TIMEOUT", PRINT_WIFI_DEBUG);
+        timeoutFlag = false;
+        retry--;
+
+        if(retry <= 0){
+          PrintDebug("Connection Failed after retries", PRINT_WIFI_DEBUG);
+          wifiCasePtr = 0; // Restart connection
+        }
+        else{
+          wifiCasePtr = 7; // Retry ping
+        }
+      }
       wifiCasePtr++;
     }
     break;
 
     // IDLE
-    case 7:
+    case 9:
     {
       mqttServer.loop(); // Keep MQTT Alive
 
@@ -810,9 +869,8 @@ void wifiConnectTask(void *parameter)
     }
     break;
 
-    // Push Measurements
-    case 10:
-    {
+    // -- Push Measurements ----------------------------------------------
+    case 20:{
       mqttServer.loop(); // Keep MQTT Alive
 
       if (readingsIndex > -1)
@@ -832,8 +890,7 @@ void wifiConnectTask(void *parameter)
     }
     break;
 
-    case 11:
-    {
+    case 21:{
       // Timeout
       if (timeoutFlag)
       {
@@ -1198,25 +1255,6 @@ String GetMacAddress(){
   Serial.println(macStr);
   return macStr;
 }
-void saveWifiCredentials(String ssid, String password, String ip){
-  prefs.begin("wifi", false); // namespace "wifi"
-  prefs.putString("ssid", ssid);
-  prefs.putString("pw", password);
-  prefs.putString("ip", ip);
-  prefs.end();
-}
-String loadSSID(){
-  prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", "");
-  prefs.end();
-  return ssid;
-}
-String loadPassword(){
-  prefs.begin("wifi", true);
-  String pw = prefs.getString("pw", "");
-  prefs.end();
-  return pw;
-}
 void writeLCD(String line1, String line2, bool showLineCnt){
   lcd_i2c.clear();
   lcd_i2c.setCursor(0, 0);
@@ -1310,9 +1348,20 @@ bool getKeypad(char *out, size_t outSize){
 }
 
 // MQTT
+void mqttPing(){
+  gotPing = false;
+  MqttJsonDoc mqttPacket;
+
+  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = "";
+  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  mqttPacket[MQTT_JSON_PAYLOAD] = "";
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_PING;
+
+  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+}
 void mqttRx(char *topic, byte *payload, unsigned int length)
 {
-
   Serial.print("MQTT RX: ");
   Serial.write(payload, length);
   Serial.println();
@@ -1339,7 +1388,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length)
   if (_topic == MQTT_TOPIC_TO_IOT)
   {
     // Pair - Device ID Request
-    if (_cmd == MQTT_CMD_REQ_MONITOR)
+    if (_cmd == MQTT_CMD_DISCOVER)
     {
       if (isPairing)
       {
@@ -1360,7 +1409,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length)
         mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
         mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
         mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
-        mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_REQ_MONITOR;
+        mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_DISCOVER;
 
         mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
       }
@@ -1461,6 +1510,20 @@ void mqttRx(char *topic, byte *payload, unsigned int length)
     {
       dataACK = true;
     }
+
+    // PING 
+    if (_cmd == MQTT_CMD_PING)
+    {
+      gotPing = true;
+    }
+ 
+    // SETTINGS 
+    if (_cmd == MQTT_CMD_SETTINGS)
+    {
+      // TODO: Add List of Base Stations allowed.
+      // SAVE to flash
+      // SEND ACK
+    }
   }
 }
 void mqttTX(const JsonDocument &msg, const String &topic)
@@ -1509,11 +1572,26 @@ void mqttReportLiveIotData(){
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
   mqttPacket[MQTT_JSON_TO_DEVICE_ID] = connectedDeviceId;
   mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
-  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_MONITOR_DATA;
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_LIVE_MONITOR_DATA;
 
   // Payload Json
   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
   payload[MQTT_JSON_WHEEL_DISTANCE] = wheelDistance;
+
+  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+}
+void mqttReportTag(){
+  MqttJsonDoc mqttPacket;
+
+  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = connectedDeviceId;
+  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_TAG_DATA;
+
+  // Payload Json
+  JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
+  String tag = tagToString(tagCode);
+  payload[MQTT_JSON_TAG_DATA] = tag;
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
@@ -1622,13 +1700,27 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks{
 
       if (i1 != -1 && i2 != -1)
       {
-        ssid = rxData.substring(0, i1);
-        password = rxData.substring(i1 + 1, i2);
-
+        String newSsid = rxData.substring(0, i1);
+        String newPassword = rxData.substring(i1 + 1, i2);
+        char newIP[16]="";
+        bool newIPMatch = false;
+        
         // Set Global IP address part
         String ip = rxData.substring(i2 + 1);
-        ip.toCharArray(serverIP, sizeof(serverIP));
+        ip.toCharArray(newIP, sizeof(serverIP));
+        strcmp(serverIP, newIP) == 0 ? newIPMatch = true : newIPMatch = false;
 
+         if(password != newPassword || ssid != newSsid || !newIPMatch){
+          saveWifiCredToFlash(newSsid, newPassword, newIP);
+          ssid = newSsid;
+          password = newPassword;
+          strlcpy(serverIP, newIP, sizeof(serverIP));
+          PrintDebug("Save Wifi Credentials", PRINT_WIFI_DEBUG);
+        }
+        else{
+          PrintDebug("Retrieved WiFi Credentials from Flash", PRINT_WIFI_DEBUG);
+        } 
+       
         PrintDebug("SSID: " + ssid, true);
         PrintDebug("Password: " + password, PRINT_CREDENTIALS_DEBUG);
 
@@ -1832,7 +1924,6 @@ void loadReadingsCountFromFlash()
 }
 void loadUsersFromFlash()
 {
-
   File f = LittleFS.open("/users.bin", "r");
   userCount = 0;
 
@@ -1848,23 +1939,10 @@ int findUserInFlash(uint8_t tag[8])
 {
   for (int i = 0; i < userCount; i++)
   {
-
     if (memcmp(users[i].tag, tag, 8) == 0)
       return i;
   }
   return -1;
-}
-String getUserVerFromFlash()
-{
-
-  if (!LittleFS.exists("/users_version.txt"))
-    return "";
-
-  File f = LittleFS.open("/users_version.txt");
-  String v = f.readString();
-  f.close();
-
-  return v;
 }
 void saveUserVerToFlash(String v)
 {
@@ -1872,6 +1950,34 @@ void saveUserVerToFlash(String v)
   File f = LittleFS.open("/users_version.txt", "w");
   f.print(v);
   f.close();
+}
+void saveWifiCredToFlash(String ssid, String password, String ip){
+  prefs.begin(FLASH_WIFI_CRED, false);
+  prefs.putString(FLASH_SET_SSID, ssid);
+  prefs.putString(FLASH_SET_PASSWORD, password);
+  prefs.putString(FLASH_SET_IP, ip);
+  prefs.end();
+}
+void loadWifiCredFromFlash(){
+  prefs.begin(FLASH_WIFI_CRED, true);
+  String newSsid = prefs.getString(FLASH_SET_SSID, "");
+  String newPassword = prefs.getString(FLASH_SET_PASSWORD, "");
+  
+  if(!newPassword.isEmpty()) password = newPassword;
+  if(!newSsid.isEmpty()) ssid = newSsid;
+
+  String ip = prefs.getString(FLASH_SET_IP, "");
+  if (ip.length() > 0 && ip.length() < sizeof(serverIP)) {
+    memset(serverIP, 0, sizeof(serverIP));  // clear old data
+    ip.toCharArray(serverIP, sizeof(serverIP));
+  }
+
+ PrintDebug(String("From FLASH -  ") +
+                 FLASH_SET_SSID + String(": ") + newSsid + ", " +
+                 FLASH_SET_PASSWORD + String(": ") + newPassword + ", " +
+                 FLASH_SET_IP + String(": ") + ip,
+                 PRINT_FLASH_DEBUG);
+  prefs.end();
 }
 
 void setup(){
@@ -2066,6 +2172,7 @@ void loop(){
       PrintDebug("Start Wheel", PRINT_GENERAL_DEBUG);
     }
 
+    // tag Presented
     if (tagPresented)
     {
       tagPresented = false;
@@ -2458,6 +2565,10 @@ void loop(){
     {
       String tag = tagToString(tagCode);
       writeLCD("Tag", tag.substring(0, 10));
+    }
+
+    if(isWifiConnected){
+      mqttReportTag();
     }
 
     startTimout(3);
