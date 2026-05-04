@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PlatformIO: Generate compile_commands.json",
+      "type": "shell",
+      "command": "pio",
+      "args": ["run", "-t", "compiledb"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "windows": {
+        "command": "${userHome}\\.platformio\\penv\\Scripts\\pio.exe"
+      },
+      "linux": {
+        "command": "${userHome}/.platformio/penv/bin/pio"
+      },
+      "osx": {
+        "command": "${userHome}/.platformio/penv/bin/pio"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      }
+    }
+  ]
+}
