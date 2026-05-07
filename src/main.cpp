@@ -68,7 +68,7 @@ int32_t settingsTicksPerMeter = 0;
 
 int wifiCasePtr = 0;
 int mainCasePtr = 0;
-int mainSubCasePtr = 0;
+int subCasePtr = 0;
 bool isBluetoothConnected = false;
 bool isWifiConnected = false;
 bool isMqttServiceConnected = false;
@@ -161,26 +161,9 @@ const String JSON_OPERATOR_SURNAME = "surname";
 const String JSON_OPERATOR_TAG_ID = "tagId";
 const String JSON_OPERATOR_ACCESS_LEVEL = "accessLevel";
 
-// FLASH Data Structure
-struct Readings {
-  char operatorName[17];   // max 16 chars + null
-  char supervisorName[17]; // max 16 chars + null
-  float distance;
-  int lines;
-};
-
-struct User {
-  uint8_t tag[8];
-  char name[30];
-  char accessLevel[30];
-};
-
 const String ACCESS_LEVEL_SUPERVISOR = "supervisor";
 const String ACCESS_LEVEL_OPERATOR = "operator";
 
-Readings currentReading;
-uint8_t readingsCount = 0;
-int8_t readingsIndex = 0;
 const char *FLASH_READINGS_KEY = "readings";
 const char *FLASH_READINGS_DATA = "data";
 const char *FLASH_SETTINGS = "settings";
@@ -221,7 +204,31 @@ using MqttJsonDoc =
 
 #define ADC_BATTERY 36
 
+// IOT Readings
+#define MAX_READINGS 100
+struct Readings {
+  char session[21];   // 20 chars + \0
+  char operatorName[17];   // 16 chars + \0
+  char supervisorName[17];
+  char userDocId[29]; // 28 + \0 
+  char monDocId[29]; 
+  char gpsCoord[21];  
+  float distance;
+  int lines;
+};
+Readings readings[MAX_READINGS];
+Readings currentReading;
+uint8_t readingsCount = 0;
+int8_t readingsIndex = 0;
+
+
 // User Tags
+struct User {
+  uint8_t tag[8];
+  char name[30];
+  char accessLevel[30];
+};
+
 #define MAX_USERS 100
 OneWire dsTag(TAG_READER);
 byte tagCode[8];
@@ -332,6 +339,7 @@ const bool PRINT_CREDENTIALS_DEBUG = true;
 const bool PRINT_WIFI_DEBUG = true;
 const bool PRINT_BT_DEBUG = true;
 const bool PRINT_DEBOUNCE_DEBUG = true;
+bool simulateWheelDistance = false;
 
 // LittleFS Filenames
 const String OPERATOR_VER_FILE = "/operators_version.bin";
@@ -422,7 +430,11 @@ time_t getTimeStamp() {
 void IRAM_ATTR onTimerOneSec() {
   if (runningTime == 0) {
     timeoutFlag = true;
-    timerAlarmDisable(timer);
+    if(simulateWheelDistance) {
+      wheelDistance += 0.5; // Simulate 0.5 meter every second
+    }else{
+      timerAlarmDisable(timer);
+    }
   } else {
     runningTime--;
   }
@@ -822,9 +834,11 @@ void wifiConnectTask(void *parameter) {
       // if(readingsCount > 0 && retry != 0) {
       if (upKeyPressed) {
         upKeyPressed = false;
+        //deleteReadingsFromFlash();
+
         if (readingsCount > 0) {
           readingsIndex = readingsCount - 1;
-          wifiCasePtr = 10;
+          wifiCasePtr = 20;
         }
       }
 
@@ -836,8 +850,7 @@ void wifiConnectTask(void *parameter) {
       mqttServer.loop(); // Keep MQTT Alive
 
       if (readingsIndex > -1) {
-        PrintDebug(String("Pushing Measurement: ") + String(readingsIndex),
-                   PRINT_WIFI_DEBUG);
+        PrintDebug(String("Pushing Measurement: ") + String(readingsIndex), PRINT_WIFI_DEBUG);
         mqttPushIotData(readingsIndex);
         startTimout(5);
         wifiCasePtr++;
@@ -845,7 +858,7 @@ void wifiConnectTask(void *parameter) {
         PrintDebug(String("DELETE FLASH"), PRINT_WIFI_DEBUG);
         // deleteReadingsFromFlash();
         newReadingsPushed = true;
-        wifiCasePtr = 7;
+        wifiCasePtr = 9;
       }
     } break;
 
@@ -855,14 +868,14 @@ void wifiConnectTask(void *parameter) {
         timeoutFlag = false;
         PrintDebug(String("TIMEOUT"), PRINT_WIFI_DEBUG);
         retry--;
-        wifiCasePtr = 7;
+        wifiCasePtr = 9;
       }
 
       // Base ACK
       if (dataACK) {
         dataACK = false;
         readingsIndex--;
-        wifiCasePtr = 10;
+        wifiCasePtr = 20;
       }
     }
 
@@ -1597,8 +1610,8 @@ void mqttReportMyID() {
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
 bool mqttPushIotData(int index) {
-  std::vector<Readings> measures;
-  getAllReadings(measures);
+  std::vector<Readings> readings;
+  getAllReadings(readings);
 
   MqttJsonDoc mqttPacket;
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -1609,11 +1622,10 @@ bool mqttPushIotData(int index) {
   // Payload Json
   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
 
-  payload[JSON_SET_DISTANCE] =
-      roundf(measures[index].distance * 100.0f) / 100.0f;
-  payload[JSON_SET_OPERATOR] = measures[index].operatorName;
-  payload[JSON_SET_SUPERVISOR] = measures[index].supervisorName;
-  payload[JSON_SET_LINES] = measures[index].lines;
+  payload[JSON_SET_DISTANCE] = roundf(readings[index].distance * 100.0f) / 100.0f;
+  payload[JSON_SET_OPERATOR] = readings[index].operatorName;
+  payload[JSON_SET_SUPERVISOR] = readings[index].supervisorName;
+  payload[JSON_SET_LINES] = readings[index].lines;
   payload[JSON_SET_TIMESTAMP] = getTimeStamp();
 
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
@@ -1767,7 +1779,7 @@ void bt_StartAdvertising() {
              PRINT_BT_DEBUG);
 }
 
-// Flash Read / Write
+// Read/Write Prevs
 void saveSettingsToFlash() {
   char _iotType[32];
   char _iotName[32];
@@ -1830,64 +1842,6 @@ void readSettingsFromFlash() {
 
   prefs.end();
 }
-void saveReadingsToFlash(Readings &measure) {
-  const String data = FLASH_READINGS_DATA + String(readingsCount++);
-
-  PrintDebug(String("TO FLASH: ") + FLASH_READINGS_DATA +
-                 String(readingsCount) + "," + measure.supervisorName + "," +
-                 measure.operatorName + "," + String(measure.distance) + "," +
-                 String(measure.lines),
-
-             PRINT_FLASH_DEBUG);
-
-  prefs.begin(FLASH_READINGS_KEY,
-              prefs.putBytes(data.c_str(), &measure, sizeof(measure)));
-  prefs.putUInt("count", readingsCount);
-  prefs.end();
-}
-bool readReadingsFromFlash(const char *key, Readings &out) {
-  prefs.begin(FLASH_READINGS_KEY, true);
-
-  if (!prefs.isKey(key)) {
-    prefs.end();
-    return false;
-  }
-
-  size_t len = prefs.getBytes(key, &out, sizeof(out));
-  if (len != sizeof(out)) {
-    prefs.end();
-    return false;
-  }
-
-  prefs.end();
-  return true;
-}
-void getAllReadings(std::vector<Readings> &data) {
-  data.clear();
-  data.reserve(readingsCount);
-
-  for (int i = 0; i < readingsCount; i++) {
-    String dataPtr = FLASH_READINGS_DATA + String(i);
-    Readings m;
-
-    if (readReadingsFromFlash(dataPtr.c_str(), m)) {
-      data.push_back(m);
-    }
-  }
-}
-void deleteReadingsFromFlash() {
-  prefs.begin(FLASH_READINGS_KEY, true);
-  prefs.clear();
-  prefs.end();
-}
-void readReadingsCountFromFlash() {
-  prefs.begin(FLASH_READINGS_KEY, true);
-  size_t count = prefs.getUInt("count", 0);
-  readingsCount = count;
-  PrintDebug(String("From FLASH - Readings Count: ") + readingsCount,
-             PRINT_FLASH_DEBUG);
-  prefs.end();
-}
 void saveWifiCredToFlash(String ssid, String password, String ip) {
   PrintDebug("Writing WIFI Cred", PRINT_FLASH_DEBUG);
 
@@ -1937,7 +1891,7 @@ void readWifiCredFromFlash() {
   }
 }
 
-// Read / Write File
+// Read/Write File (Operators)
 void saveOperatorsToFile(const char *operators) {
 
   if (operators && strlen(operators) > 0) {
@@ -1997,7 +1951,8 @@ void saveOperatorsToFile(const char *operators) {
             s_access = s_access.substring(0, 29);
           }
         }
-      } else if (v.is<const char *>()) {
+      } 
+      else if (v.is<const char *>()) {
         tag = v.as<const char *>();
       }
 
@@ -2096,6 +2051,78 @@ String readOperatorVerFile() {
   return "0";
 }
 
+// Read / Write File (Reading)
+void saveReadingsToFlash(Readings &measure) {
+  const String data = FLASH_READINGS_DATA + String(readingsCount++);
+
+  PrintDebug(String("TO FLASH: ") + FLASH_READINGS_DATA +
+      String(readingsCount) + "," + measure.supervisorName + "," +
+      measure.operatorName + "," + String(measure.distance) + "," +
+      String(measure.lines),
+    PRINT_FLASH_DEBUG);
+
+  prefs.begin(FLASH_READINGS_KEY, prefs.putBytes(data.c_str(), &measure, sizeof(measure)));
+  prefs.putUInt("count", readingsCount);
+  prefs.end();
+}
+bool readReadingsFromFlash(const char *key, Readings &out) {
+  prefs.begin(FLASH_READINGS_KEY, true);
+  
+  PrintDebug(String("\nReading key: ") + String(key), PRINT_FLASH_DEBUG);
+  if (!prefs.isKey(key)) {
+    prefs.end();
+    PrintDebug("\nnot a key: ", PRINT_FLASH_DEBUG);
+    return false;
+  }
+
+  size_t len = prefs.getBytes(key, &out, sizeof(out));
+  if (len != sizeof(out)) {
+    prefs.end();
+    return false;
+  }
+
+  prefs.end();
+  return true;
+}
+void 
+getAllReadings(std::vector<Readings> &data) {
+  data.clear();
+  data.reserve(readingsCount);
+
+  for (int i = 0; i < readingsCount; i++) {
+    String dataPtr = FLASH_READINGS_DATA + String(i);
+    Readings m;
+
+    if (readReadingsFromFlash(dataPtr.c_str(), m)) {
+      data.push_back(m);
+
+      PrintDebug("\n" + String(dataPtr) + ", " + 
+        "monId " + m.monDocId + ", " + 
+        "docId " + m.userDocId + ", " + 
+        "Supervisor " + m.supervisorName + ", " + 
+        "Operator " + m.operatorName + ", " +
+        "GPS " + m.gpsCoord + ", " +
+        "Distance " + String(m.distance) + ", " + 
+        "Lines " + String(m.lines), PRINT_FLASH_DEBUG 
+      );
+    }
+  }
+}
+void deleteReadingsFromFlash() {
+  prefs.begin(FLASH_READINGS_KEY, true);
+  prefs.clear();
+  prefs.end();
+}
+
+void readReadingsCountFromFlash() {
+  prefs.begin(FLASH_READINGS_KEY, true);
+  size_t count = prefs.getUInt("count", 0);
+  readingsCount = count;
+  PrintDebug(String("From FLASH - Readings Count: ") + readingsCount,
+             PRINT_FLASH_DEBUG);
+  prefs.end();
+}
+
 void setup() {
   Serial.begin(9600);
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -2179,6 +2206,8 @@ void setup() {
 
   readSettingsFromFlash();
   readReadingsCountFromFlash();
+  std::vector<Readings> myData;
+  getAllReadings(myData);
 
   // Mount NVS Flash for users
   if (!LittleFS.begin(true)) {
@@ -2231,10 +2260,10 @@ void loop() {
 
     // TESTING
     if (upKeyPressed) {
-      upKeyPressed = false;
+      //upKeyPressed = false;
       // saveWifiCredToFlash(ssid, password, serverIP);
       // readWifiCredFromFlash();
-       mqttSendSync();
+       //mqttSendSync();
     }
 
     // isPairing
@@ -2274,10 +2303,7 @@ void loop() {
       wheelTicksCount = 0;
       wheelDistance = 0;
       mainCasePtr = 20;
-      PrintDebug("CasePtr: " + String(mainCasePtr), PRINT_GENERAL_DEBUG);
-
-      writeLCD("Lets GO ...", "");
-      startTimout(DISPLAY_TIMEOUT);
+      subCasePtr = 0;
       break;
     }
 
@@ -2413,61 +2439,98 @@ void loop() {
 
   // (Wheel) Start - Present Tag
   case 20: {
-    if(timeoutFlag) {
-      timeoutFlag = false;
-      isRunning = true;
-      nrOfLanesToCut[0] = '\0';
-      laneIndex = 0;
-      tagPresented = false;
-      mainSubCasePtr = SUB_CASE_NONE;
-    
-      writeLCD("Operator Tag", "(Back)");
-      mainCasePtr++;
+    switch (subCasePtr)
+    {
+      // Lets Go
+      case 0:{
+        writeLCD("Lets GO ...", "");
+        startTimout(DISPLAY_TIMEOUT);
+        subCasePtr++;    
+      } break;
+      
+      // Start
+      case 1:{
+        if(timeoutFlag) {
+          timeoutFlag = false;
+          isRunning = true;
+          nrOfLanesToCut[0] = '\0';
+          laneIndex = 0;
+          tagPresented = false;
+          mainCasePtr++;
+          subCasePtr = 0;
+        } 
+      } break;
+      
+      default:
+        break;
     }
   } break;
 
   // (Wheel) Operator Tag
   case 21: {
-    if (backKeyPressed) {
-      backKeyPressed = false;
-      mainCasePtr = CASE_HOME;
-      mainSubCasePtr = SUB_CASE_NONE;
-    }
-
-    // Tag presented
-    if (tagPresented) {
-      tagPresented = false;
-      User user = getUserNameByTag(tagCode);
-      
-      if(user.name[0]) {
-        // Found User
-        strncpy(currentReading.operatorName, user.name, sizeof(currentReading.operatorName) - 1);
-        mainSubCasePtr = SUB_CASE_NONE;
-        mainCasePtr++;
-      } 
-      else{
-        mainSubCasePtr = 0; // Uknown Tag
-      }
-    }
-
-    // Uknown Tag / User
-    switch (mainSubCasePtr)
+    switch (subCasePtr)
     {
+      // Lets Go
+      case 0:{
+        writeLCD("Operator Tag", "(Back)");
+        subCasePtr++;
+      } break;
+
+      // Start
+      case 1:{
+        if (backKeyPressed) {
+          backKeyPressed = false;
+          mainCasePtr = CASE_HOME;
+          subCasePtr = SUB_CASE_NONE;
+        }
+        
+        // Tag presented
+        if (tagPresented) {
+          tagPresented = false;
+          User user = getUserNameByTag(tagCode);
+          
+          if(user.name[0]) {
+            // Found User
+            strncpy(currentReading.operatorName, user.name, sizeof(currentReading.operatorName) - 1);
+            subCasePtr = SUB_CASE_NONE;
+            mainCasePtr++;
+          } 
+          else{
+            subCasePtr++; // Uknown Tag
+          }
+        }     
+      } break;  
+      
       // Uknown Tag
-      case 0:
+      case 2:{
         writeLCD("Unknown Tag", "");
         startTimout(3);
-        mainSubCasePtr++;    
-        break;
+        subCasePtr++;    
+      } break;
       
-        // Timeout
-      case 1:
+      // Back to Start
+      case 3:{
         if (timeoutFlag) {
           timeoutFlag = false;
-          mainSubCasePtr = SUB_CASE_NONE;    
-          mainCasePtr = 20;
+          subCasePtr = 0;    
         }
-        break;
+      } break;
+
+       // Show Operator
+      case 4:{
+        writeLCD(currentReading.operatorName, "");
+        startTimout(2);
+        subCasePtr++;    
+      } break;
+      
+      // Proceed
+      case 5:{
+        if (timeoutFlag) {
+          timeoutFlag = false;
+          subCasePtr = SUB_CASE_NONE;
+          mainCasePtr++;    
+        }
+      } break;
       
       default:
         break;
@@ -2475,186 +2538,259 @@ void loop() {
     
   } break;
 
-  // (Wheel) Show Operator Name
-  case 22: {
-    writeLCD(currentReading.operatorName, "");
-    startTimout(2);
-    mainCasePtr++;
-  } break;
-
   // (Wheel) Start
-  case 23: {
+  case 22: {
     if (timeoutFlag) {
       timeoutFlag = false;
-      writeLCD("Distance: " + String(wheelDistance) + "m", "(Back)(Stop)");
+      writeLCD("Dist: " + String(wheelDistance) + "m", "(Back)(Stop)");
       mainCasePtr++;
+
+      //DEBUG
+      simulateWheelDistance = true;
+      startTimout(1);
+      //DEBUG
     }
   } break;
 
-  // (Wheel) Readings Distance
-  case 24: {
+  // (Wheel) Reading Distance ...
+  case 23: {
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
-      writeLCD("Distance: " + String(wheelDistance) + "m", "(Back)(Stop)");
+      writeLCD("Dist: " + String(wheelDistance) + "m", "(Back)(Stop)");
     }
 
     // Cancel
     if (backKeyPressed) {
       backKeyPressed = false;
-      mainCasePtr = CASE_HOME;
+      subCasePtr = 0;
+      mainCasePtr++;
     }
 
     // Stop
     if (stopKeyPressed) {
       stopKeyPressed = false;
-      writeLCD("Are you sure?", "(Ent)(Back)");
+      subCasePtr = 2;
       mainCasePtr++;
     }
   } break;
 
   // (Wheel) Confirm Cancel or Proceed
-  case 25: {
-    // Back - Cancel
-    if (backKeyPressed) {
-      backKeyPressed = false;
-      mainCasePtr = 23;
-    }
-
-    // Enter - Proceed
-    else if (enterKeyPressed) {
-      enterKeyPressed = false;
-      strcpy(nrOfLanesToCut, "");
-      writeLCD("Total: " + String(wheelDistance) + "m", "(Ent)(Back)");
-      startTimout(2);
-      mainCasePtr++;
-    }
-  } break;
-
-  // (Wheel) Enter Lanes to count
-  case 26: {
-    if(timeoutFlag) {
-      timeoutFlag = false;
-  
-      // Back
-      if (backKeyPressed) {
-        backKeyPressed = false;
-
-        if (laneIndex > 0) {
-          nrOfLanesToCut[--laneIndex] = '\0';
-
-          writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
-        } else {
-          mainCasePtr = 23;
-        }
-      }
-
-      // Enter
-      else if (enterKeyPressed) {
-        enterKeyPressed = false;
-        currentReading.distance = wheelDistance;
-        currentReading.lines = strtol(nrOfLanesToCut, nullptr, 10);
-        mainCasePtr++;
-      }
-
-      // Numbers
-      else if (newNumKeyPressed && laneIndex < sizeof(nrOfLanesToCut) - 1) {
-        newNumKeyPressed = false;
-
-        if (!(laneIndex == 0 && strcmp(key, KEY_0) == 0)) {
-
-          if (laneIndex < sizeof(nrOfLanesToCut) - 1) {
-            nrOfLanesToCut[laneIndex++] = key[0];
-            nrOfLanesToCut[laneIndex] = '\0';
-          }
-        }
-
-        writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
-        key[0] = '\0'; // clear key
-      }
-    }
-  } break;
-  
-  // Supervisor Tag
-  case 27:{
-    writeLCD("Supervisor Tag", "(Back)");
-    mainCasePtr++;
-  }
-
-  // (Wheel) Surpervisor tag
-  case 28: {
-    if (backKeyPressed) {
-      backKeyPressed = false;
-      mainCasePtr = 23;
-    }
-
-    if (tagPresented) {
-      tagPresented = false;
-      User user = getUserNameByTag(tagCode);
+  case 24: {
+    switch (subCasePtr) {
+      case 0:{
+        //Cancel  
+        writeLCD("Cancel?", "(Ent)(Back)");
+        subCasePtr++;    
+      } break;
       
-      if(user.name[0]) {
-        String access = String(user.accessLevel);
-        access.toLowerCase();
+      case 1:{
+        // Cancel - Cancel
+        if (backKeyPressed) {
+          backKeyPressed = false;
+          subCasePtr = SUB_CASE_NONE;
+          mainCasePtr = 22;
+        }
+
+        // Cancel - Confirm
+        if(enterKeyPressed) {
+          enterKeyPressed = false;
+          mainCasePtr = CASE_HOME;
+          subCasePtr = SUB_CASE_NONE;
+          simulateWheelDistance = false;    
+        }
+      } break;
+      
+      case 2:{
+        // Stop
+        writeLCD("Stop?", "(Ent)(Back)");
+        subCasePtr++;    
+      } break;
+      
+      case 3:{
+        // Stop - Cancel
+        if (backKeyPressed) {
+          backKeyPressed = false;
+          subCasePtr = SUB_CASE_NONE;
+          mainCasePtr = 22;
+        }
         
-        if(access != ACCESS_LEVEL_SUPERVISOR){
-          mainSubCasePtr = 2; // Not a Supervisor
-          break;
-        }
+        // Stop - Confirm
+        if(enterKeyPressed) {
+          enterKeyPressed = false;
+          mainCasePtr++;
+          subCasePtr = SUB_CASE_NONE;    
+          simulateWheelDistance = false;
 
-        strncpy(currentReading.supervisorName, user.name, sizeof(currentReading.supervisorName) - 1);
-        writeLCD(currentReading.supervisorName, "");
-        startTimout(3);
-        mainCasePtr++;
-        mainSubCasePtr = SUB_CASE_NONE;
-      } else {
-        mainSubCasePtr = 0; // Tag Uknown
-      }
-    }
-
-    switch (mainSubCasePtr) {
-      case 0:
-        writeLCD("Uknown Tag", "");
-        startTimout(3);
-        mainSubCasePtr = 2;    
-        break;
-      
-        case 1:
-        writeLCD("Not a", "Supervisor");
-        startTimout(3);
-        mainSubCasePtr++;    
-        break;
-      
-      case 2:
-        if (timeoutFlag) {
-          timeoutFlag = false;
-          mainSubCasePtr = SUB_CASE_NONE;    
-          mainCasePtr = 27;
+          strcpy(nrOfLanesToCut, "");
+          writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
         }
-        break;
-      
+      }  break;
+     
       default:
+        subCasePtr = SUB_CASE_NONE; 
       break;
     }
   } break;
 
-  // (Wheel) Save
-  case 29: {
-    if (timeoutFlag) {
-      timeoutFlag = false;
+  // (Wheel) Enter Lanes to count
+  case 25: {
 
-      saveReadingsToFlash(currentReading);
-      writeLCD(String(wheelDistance) + "m X " + String(nrOfLanesToCut),
-               "SAVED");
-      startTimout(3);
+    // Back
+    if (backKeyPressed) {
+      backKeyPressed = false;
+
+      if (laneIndex > 0) {
+        nrOfLanesToCut[--laneIndex] = '\0';
+
+        writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
+      } else {
+        mainCasePtr = 23;
+      }
+    }
+
+    // Enter
+    else if (enterKeyPressed) {
+      enterKeyPressed = false;
+      currentReading.distance = wheelDistance;
+      currentReading.lines = strtol(nrOfLanesToCut, nullptr, 10);
       mainCasePtr++;
+      subCasePtr = 0;
     }
+
+    // Numbers
+    else if (newNumKeyPressed && laneIndex < sizeof(nrOfLanesToCut) - 1) {
+      newNumKeyPressed = false;
+
+      if (!(laneIndex == 0 && strcmp(key, KEY_0) == 0)) {
+
+        if (laneIndex < sizeof(nrOfLanesToCut) - 1) {
+          nrOfLanesToCut[laneIndex++] = key[0];
+          nrOfLanesToCut[laneIndex] = '\0';
+        }
+      }
+
+      writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
+      key[0] = '\0'; // clear key
+    }
+  } break;
+  
+  // Supervisor Tag
+  case 26:{
+    switch (subCasePtr) {
+      
+      // Supervisor Tag
+      case 0:{
+          writeLCD("Supervisor Tag", "(Back)");
+          subCasePtr++;    
+      }
+      break;
+       
+      // Wait for Tag
+      case 1:{
+        if (backKeyPressed) {
+          backKeyPressed = false;
+          mainCasePtr = 22;
+        }
+
+        if (tagPresented) {
+          tagPresented = false;
+          User user = getUserNameByTag(tagCode);
+          
+          if(user.name[0]) {
+            String access = String(user.accessLevel);
+            access.toLowerCase();
+            
+            if(access != ACCESS_LEVEL_SUPERVISOR){
+              subCasePtr = 4; // Not a Supervisor
+              break;
+            }
+
+            strncpy(currentReading.supervisorName, user.name, sizeof(currentReading.supervisorName) - 1);
+            subCasePtr = 6;
+          } else {
+            subCasePtr++; // Tag Uknown
+          }
+        }
+      }
+      break;
+      
+      // Unknown Tag
+      case 3:{
+        writeLCD("Uknown Tag", "");
+        startTimout(3);
+        subCasePtr = 5;    
+      }
+      break;
+    
+      // Tag not allowed
+      case 4:{
+        writeLCD("Tag not allowed", "");
+        startTimout(3);
+        subCasePtr++;    
+      }
+      break;
+    
+      // Back to Start
+      case 5:{
+        if (timeoutFlag) {
+          timeoutFlag = false;
+          subCasePtr = 0;    
+        }
+      }
+      break;
+    
+      // Proceed
+      case 6:{
+        writeLCD(currentReading.supervisorName, "");
+        startTimout(3);
+        subCasePtr++;           
+      }
+      break;
+
+      // Display Timeout
+      case 7:{
+        if (timeoutFlag) {
+          timeoutFlag = false;
+          mainCasePtr++;
+          subCasePtr = 0;           
+        }
+      }
+      break;
+    
+      default:
+        subCasePtr = SUB_CASE_NONE; 
+      break;
+    }
+  } break;
+  
+  // (Wheel) Save
+  case 27: {
+    switch (subCasePtr) {
+      case 0:
+        if (timeoutFlag) {
+          timeoutFlag = false;
+
+          saveReadingsToFlash(currentReading);
+          writeLCD(String(wheelDistance) + "m X " + String(nrOfLanesToCut),"SAVED");
+          startTimout(3);
+          subCasePtr++;
+        }    
+      break;
+      
+      case 1:
+       if (timeoutFlag) {
+            mainCasePtr = CASE_HOME;
+            subCasePtr = SUB_CASE_NONE; 
+          }
+      break;
+           
+      default:
+        subCasePtr = SUB_CASE_NONE; 
+      break;
+    }
+    
   } break;
 
-  // (Wheel) Saved
-  case 30: {
-    if (timeoutFlag) {
-      mainCasePtr = 2;
-    }
-  } break;
 
   // ----------------------------------------
   // Live Data

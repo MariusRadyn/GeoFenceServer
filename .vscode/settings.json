@@ -2,5 +2,7 @@
   "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
   "clangd.arguments": [
     "--compile-commands-dir=${workspaceFolder}"
-  ]
+  ],
+  "platformio-ide.useBuiltinPIOCore": false,
+  "platformio-ide.customPATH": "C:\\Users\\MRadyn\\AppData\\Roaming\\Python\\Python313\\Scripts;${env:PATH}"
 }
