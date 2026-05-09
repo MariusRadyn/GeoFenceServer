@@ -1,6 +1,7 @@
 // ESP32 GeoFence Monitor
 
 #include "FS.h"
+#include "pgmspace.h"
 #include "time.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -13,21 +14,22 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
 
 const String VERSION = "V1.0";
 
 hw_timer_t *timer = NULL;
 volatile bool timeoutFlag = false;
-
+time_t START_OF_TIME = 1700000000; // 2023-11-10 00:00:00
 Preferences prefs;
 
 // wifi
 WiFiClient wifiClient;
 PubSubClient mqttServer(wifiClient);
-
 String ssid = "";
 String password = "";
-
 char serverIP[16];
 const int port = 8080;
 
@@ -217,11 +219,12 @@ struct IotData_Wheel {
   char gpsCoord[21];  
   float distance;
   int lines;
+  char timestamp[15]; // 14 chars + \0
 };
 
 IotData_Wheel iotDataWheel [MAX_MEASURE];
 IotData_Wheel currentIotDataWheel;
-size_t iotDataCount = 0;
+int iotDataCount = 0;
 int8_t iotDataIndex = 0;
 int session = 0;
 bool sessionOpen = false;
@@ -247,6 +250,8 @@ bool maxUsersReached = false;
 // LCD
 LiquidCrystal_I2C lcd_i2c(0x27, 16,
                           2); // I2C address 0x27, 16 column and 2 rows
+char lcdLine1[17] = {0};
+char lcdLine2[17] = {0};
 
 // Keypad
 const int ROWS = 4;
@@ -296,7 +301,7 @@ TaskHandle_t IotTaskHandle = NULL;
 #define DISPLAY_TIMEOUT 2 // seconds
 #define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
 #define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
-const String NAME_PREFIX = "iOT"; // Bluetooth Prefix
+const String NAME_PREFIX = "iOT_"; // Bluetooth Prefix
 NimBLECharacteristic *pChar = nullptr;
 NimBLEServer *pServer = nullptr;
 NimBLEService *pService = nullptr;
@@ -331,6 +336,7 @@ bool dataACK = false;
 bool isRunning = false;
 bool iotTypeError = false;
 bool getFirstBatReading = true;
+bool newBatReadingAvailable = false;
 bool buzzerTag = false;
 
 // Battery
@@ -350,6 +356,7 @@ bool simulateWheelDistance = false;
 const String OPERATOR_VER_FILE = "/operators_version.bin";
 const String OPERATORS_FILE = "/operators.bin";
 const String IOTDATA_FILE = "/iotdata.bin";
+const String SESSION_NR_FILE = "/session_nr.bin";  // only used when time is not set
 
 // Declare functions
 void DebouncePairBtn();
@@ -365,8 +372,9 @@ void bt_StartAdvertising();
 void mqttTX(const JsonDocument &msg, const String &topic);
 void mqttRx(char *topic, byte *payload, unsigned int length);
 void PrintDebug(String, bool);
-void writeLCD(String line1, String line2);
-void writeLCD(String line1, String line2, bool cnt);
+void writeLCD(const char *line1, const char *line2);
+void writeLCD(const char *line1, const char *line2, bool showMeasureCnt);
+void refreshLCD();
 bool getKeypad(char *out, size_t outSize);
 void saveDistancesToNVM(int value);
 void saveWifiCredToFlash(String ssid, String password, String ip);
@@ -387,6 +395,11 @@ void getAllReadings(std::vector<IotData_Wheel> &data);
 bool wifiCredentialsExist();
 String tagToString(byte *addr);
 void mqttSendSync();
+String GetMacAddress();
+String readSessionNrFromFile() ;
+void writeSessionNrToFile(const char *session);
+void deleteIotDataFile();
+void deleteSessionNrFile();
 
 //------------------------------------------------------------------------------------------------
 // Code
@@ -429,6 +442,11 @@ String getTimeDateString() {
 time_t getTimeStamp() {
   time_t now;
   time(&now);
+  
+  PrintDebug("Timestamp: " + String(now), PRINT_GENERAL_DEBUG);
+  if(now < 1700000000){
+    now = START_OF_TIME; // 2023-11-10 00:00:00
+  }
   return now;
 }
 
@@ -453,8 +471,12 @@ void startTimout(int seconds) {
 }
 
 // Interrupts
-void IRAM_ATTR wheelSensor1ISR() { debWheel1FallEdge = true; }
-void IRAM_ATTR wheelSensor2ISR() { debWheel2FallEdge = true; }
+void IRAM_ATTR wheelSensor1ISR() { 
+  debWheel1FallEdge = true; 
+}
+void IRAM_ATTR wheelSensor2ISR() { 
+  debWheel2FallEdge = true; 
+}
 
 // Tasks
 void GeneralTask(void *parameter) {
@@ -656,11 +678,12 @@ void GeneralTask(void *parameter) {
       // Every 30 seconds or first reading
       getFirstBatReading = false;
       batReadDelay = 0;
+      
       int adcValue = analogRead(ADC_BATTERY);
-      batteryLevel = map(adcValue, 0, 3800, 0,
-                         100); // Assuming a 12-bit ADC (3800 Max count)
-      if (batteryLevel > 100)
-        batteryLevel = 100; // Cap at 100%
+      batteryLevel = map(adcValue, 0, 3800, 0, 100); // Assuming a 12-bit ADC (3800 Max count)
+      if (batteryLevel > 100) batteryLevel = 100; // Cap at 100%
+      newBatReadingAvailable = true;
+
       PrintDebug("Battery Level: " + String(adcValue) + " (" +
                      String(batteryLevel) + "%)",
                  PRINT_GENERAL_DEBUG);
@@ -691,16 +714,21 @@ void wifiConnectTask(void *parameter) {
       gotWifiCredentials = false;
       showMsgOnce = true;
 
-      // readWifiCredFromFlash();
-      if (!password.isEmpty() && !ssid.isEmpty()) {
-        WiFi.begin(ssid, password);
-        PrintDebug("Start Wifi ", PRINT_WIFI_DEBUG);
-      }
+      readWifiCredFromFlash();
 
       bt_StartServer();
       bt_StartAdvertising();
-      startTimout(5);
-      wifiCasePtr++;
+      
+      if (!password.isEmpty() && !ssid.isEmpty()) {
+        // Use Wifi Connection
+        WiFi.begin(ssid, password);
+        PrintDebug("Got Credentials, Start Wifi ", PRINT_WIFI_DEBUG);
+        wifiCasePtr = 3;
+      }else{
+        // Use Bluetooth Connection
+        startTimout(5);
+        wifiCasePtr++;  
+      }
     } break;
 
     // Wait for bluetooth Connection
@@ -712,7 +740,8 @@ void wifiConnectTask(void *parameter) {
       }
       if (timeoutFlag) {
         if (WiFi.status() == WL_CONNECTED) {
-          wifiCasePtr = 4; // Skip Bluetooth if already connected to WiFi
+          PrintDebug("No Bluetooth found. Check Wifi", PRINT_WIFI_DEBUG);
+          wifiCasePtr = 3; // Skip Bluetooth if already connected to WiFi
         }
       }
     } break;
@@ -1205,6 +1234,34 @@ User getUserNameByTag(uint8_t searchTag[8]) {
     return {}; // not found
 }
 String getDeviceName() {
+ 
+  String mac = GetMacAddress();
+  String deviceName = NAME_PREFIX;
+  deviceName += mac;
+
+  return deviceName;
+}
+String GetMacAddress() {
+  uint64_t mac = ESP.getEfuseMac();
+
+  char macStr[13];
+
+  snprintf(
+    macStr, 
+    sizeof(macStr),
+    "%02X%02X%02X%02X%02X%02X",
+      (uint8_t)(mac >> 40),
+      (uint8_t)(mac >> 32),
+      (uint8_t)(mac >> 24),
+      (uint8_t)(mac >> 16),
+      (uint8_t)(mac >> 8),
+      (uint8_t)(mac)
+    );
+
+  PrintDebug(macStr, PRINT_GENERAL_DEBUG);
+  return String(macStr);
+}
+String GetMacAddress2() {
   // Read raw 48-bit efuse MAC (never modified)
   uint64_t mac = ESP.getEfuseMac();
 
@@ -1216,79 +1273,120 @@ String getDeviceName() {
 
   // Format as 12-char hex string (uppercase)
   char macStr[13]; // 12 hex chars + null
-  sprintf(macStr, "%02X%02X%02X%02X%02X%02X", macBytes[5], macBytes[4],
-          macBytes[3], macBytes[2], macBytes[1], macBytes[0]);
+  sprintf(
+    macStr, 
+    "%02X%02X%02X%02X%02X%02X", 
+    macBytes[5], macBytes[4], macBytes[3], macBytes[2], macBytes[1], macBytes[0]);
 
-  // Build device name
-  String deviceName = NAME_PREFIX + "_";
-  deviceName += macStr;
-
-  return deviceName;
-}
-String GetMacAddress() {
-  uint64_t mac = ESP.getEfuseMac();
-  uint8_t macArr[6];
-  for (int i = 0; i < 6; i++) {
-    macArr[i] = (mac >> (8 * i)) & 0xFF;
-  }
-
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", macArr[5],
-           macArr[4], macArr[3], macArr[2], macArr[1], macArr[0]);
-
-  Serial.println(macStr);
+  PrintDebug(macStr, PRINT_GENERAL_DEBUG);
   return macStr;
 }
-void writeLCD(String line1, String line2, bool showLineCnt) {
-  lcd_i2c.clear();
+void writeLCD(const char* line1, const char* line2, bool showMeasureCnt) {
+  char buffer1[17];
+  char buffer2[17];
+  char percent[6];  // " 100%"
+  char measureCount[7];  // " (999)"
+
+  // Format Measurements Count safely
+  snprintf(measureCount, sizeof(measureCount), " (%d)", iotDataCount);
+
+  // Format percent safely
+  snprintf(percent, sizeof(percent), " %d%%", batteryLevel);
+
+  // ---- LINE 1 ----
+  int textWidth = 16 - strlen(measureCount);
+
+  if(showMeasureCnt){
+    snprintf(
+      buffer1, 
+      sizeof(buffer1), 
+      "%-*.*s%s", textWidth, textWidth, line1, measureCount
+    );
+  }else{
+    snprintf(
+      buffer1, 
+      sizeof(buffer1), 
+      "%-16.16s", line1
+    );
+  }
+  
+  // ---- LINE 2 ----
+  textWidth = 16 - strlen(percent);
+
+  snprintf(
+    buffer2, 
+    sizeof(buffer2),
+    "%-*.*s%s", textWidth, textWidth, line2, percent
+  );
+
+  // ---- LCD UPDATE ----
   lcd_i2c.setCursor(0, 0);
-
-  // Insert Measurement Counts
-  if (showLineCnt) {
-    String cnt = String(" (") + String(iotDataCount) + ")";
-
-    if (line1.length() > 16 - cnt.length()) {
-      line1 = line1.substring(0, 16 - cnt.length());
-    } else {
-      while (line1.length() < 16 - cnt.length()) {
-        line1 += " ";
-      }
-    }
-    line1 += cnt;
-  }
-
-  lcd_i2c.print(line1);
-
-  // Insert Percent
-  String percent = String(" ") + String(batteryLevel) + "%";
-  if (line2.length() > 16 - percent.length()) {
-    line2 = line2.substring(0, 16 - percent.length());
-  } else {
-    while (line2.length() < 16 - percent.length()) {
-      line2 += " ";
-    }
-  }
-  line2 += percent;
+  lcd_i2c.print(buffer1);
 
   lcd_i2c.setCursor(0, 1);
-  lcd_i2c.print(line2);
+  lcd_i2c.print(buffer2);
+}
+void writeLCD(const char* line1, const char* line2) {
+  char buffer1[17];
+  char buffer2[17];
+  char percent[6];  // " 100%"
+  
+  // Format percent safely
+  snprintf(percent, sizeof(percent), " %d%%", batteryLevel);
+
+  // ---- LINE 1 ----
+  snprintf(
+    buffer1, 
+    sizeof(buffer1), 
+    "%-16.16s", line1
+  );
+    
+  // ---- LINE 2 ----
+  int textWidth = 16 - strlen(percent);
+
+  snprintf(
+    buffer2, 
+    sizeof(buffer2),
+    "%-*.*s%s", textWidth, textWidth, line2, percent
+  );
+
+  // ---- LCD UPDATE ----
+  lcd_i2c.setCursor(0, 0);
+  lcd_i2c.print(buffer1);
+
+  lcd_i2c.setCursor(0, 1);
+  lcd_i2c.print(buffer2);
 }
 void writeLCD(String line1, String line2) {
-  lcd_i2c.clear();
+  writeLCD(line1.c_str(), line2.c_str());
+}
+void writeLCD(String line1, String line2, bool showMeasureCnt) {
+  writeLCD(line1.c_str(), line2.c_str(), showMeasureCnt);
+}
+void writeSetLanesPrompt() {
+  char laneLine[17];
+  snprintf(laneLine, sizeof(laneLine), "Set Lanes: %s", nrOfLanesToCut);
+  writeLCD(laneLine, "(Ent)(Back)");
+}
+void refreshLCD() {
+  if (lcdLine1[0] == '\0' || lcdLine2[0] == '\0') return;
+
+  char line2[17];  // final output (16 chars + null)
+
+  // Format: text left + percent right-aligned
+  snprintf(
+    line2, 
+    sizeof(line2), 
+    "%-11.11s %3d%%", lcdLine2, batteryLevel
+  );
+
   lcd_i2c.setCursor(0, 0);
-  lcd_i2c.print(line1);
+  lcd_i2c.print("                ");
+  lcd_i2c.setCursor(0, 0);
+  lcd_i2c.print(lcdLine1);
 
-  // Insert Percent
-  String percent = String(" ") + String(batteryLevel) + "%";
-  if (line2.length() > 16 - percent.length()) {
-    line2 = line2.substring(0, 16 - percent.length());
-  } else {
-    while (line2.length() < 16 - percent.length()) {
-      line2 += " ";
-    }
-  }
-  line2 += percent;
-
+  lcd_i2c.setCursor(0, 1);
+  lcd_i2c.print("                ");
   lcd_i2c.setCursor(0, 1);
   lcd_i2c.print(line2);
 }
@@ -1313,6 +1411,28 @@ bool getKeypad(char *out, size_t outSize) {
     digitalWrite(rowPins[r], HIGH);
   }
   return false;
+}
+String createNewSessionNumber(){
+  
+  String session = readSessionNrFromFile();
+  int sNr = session.toInt() + 1;
+  writeSessionNrToFile(String(sNr).c_str());
+  String mac = GetMacAddress();
+
+  return mac + String(sNr) ;
+}
+bool compareString(const char *a, const char *b) {
+  if (!a || !b) {
+    return false;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return false;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
 }
 
 // MQTT
@@ -1884,16 +2004,47 @@ void readWifiCredFromFlash() {
       ip.toCharArray(serverIP, sizeof(serverIP));
     }
 
-    PrintDebug(String("Read WIFI Cred from FLASH -  ") + FLASH_WIFI_SSID +
-                   String(": ") + newSsid + ", " + FLASH_WIFI_PASSWORD +
+    gotWifiCredentials = true;
+    PrintDebug(
+      String("WIFI Cred (FLASH) -  ") + FLASH_WIFI_SSID + String(": ") + newSsid + ", " + FLASH_WIFI_PASSWORD +
                    String(": ") + newPassword + ", " + FLASH_WIFI_IP +
                    String(": ") + ip,
-               PRINT_FLASH_DEBUG);
+      PRINT_FLASH_DEBUG);
 
     prefs.end();
   } catch (const std::exception &e) {
     PrintDebug(String("readWifiCredFromFlash(): ") + e.what(), PRINT_ERRORS);
     return;
+  }
+}
+
+// Read/Write File (Session Number)
+void writeSessionNrToFile(const char *session ) {
+  File f = LittleFS.open(SESSION_NR_FILE, "w");
+  f.print(session);
+  f.close();
+  PrintDebug("Saved Session Nr to file:" + String(session), PRINT_FLASH_DEBUG);
+}
+String readSessionNrFromFile() {
+  if (LittleFS.exists(SESSION_NR_FILE)) {
+    File f = LittleFS.open(SESSION_NR_FILE, "r");
+    String session = "0";
+
+    if (f.available()) {
+      session = f.readString();
+    }
+
+    f.close();
+    PrintDebug("Read Session Nr from file:" + String(session), PRINT_FLASH_DEBUG);
+    return session;
+  }
+
+  return "0";
+}
+void deleteSessionNrFile() {
+  if (LittleFS.exists(SESSION_NR_FILE)) {
+    LittleFS.remove(SESSION_NR_FILE);
+    PrintDebug("Deleted Session Nr file", PRINT_FLASH_DEBUG);
   }
 }
 
@@ -2050,7 +2201,7 @@ String readOperatorVerFile() {
     }
 
     f.close();
-    printf("Read Operator Version from file: %s \n", ver);
+    printf("Read Operator Version from file: %s \n", ver.c_str());
     return ver;
   }
 
@@ -2085,9 +2236,7 @@ void writeIotDataToFile(IotData_Wheel iotdata) {
 
   file.close();
 }
-void readIotDataFromFile() {
-  Serial.println("readIotDataFromFile");
-
+void readIotDataFile() {
   File file = LittleFS.open(IOTDATA_FILE, FILE_READ);
   if (!file) {
     Serial.println("Failed to open file");
@@ -2101,8 +2250,6 @@ void readIotDataFromFile() {
         file.read(reinterpret_cast<uint8_t *>(&iotDataWheel[iotDataCount]),
                   sizeof(IotData_Wheel));
     
-    Serial.printf("File Len %zu\n", readLen);
-    
     if (readLen != sizeof(IotData_Wheel)) {
       break;
     }
@@ -2114,106 +2261,29 @@ void readIotDataFromFile() {
     Serial.printf("Loaded %u iotData\n", static_cast<unsigned int>(iotDataCount));
 
     for (int i = 0; i < iotDataCount; i++) {
-      printf("IOT%i: Operator: %s, Supervisor: %s, UserId: %s, MonId: %s, GPS: %s, Distance: %f, Lines: %i\n", 
+      printf("IOT%i: Session: %s, Operator: %s, Supervisor: %s, UserId: %s, MonId: %s, GPS: %s, Distance: %f, Lines: %i, time: %s\n", 
         i, 
+        iotDataWheel[i].session, 
         iotDataWheel[i].operatorName, 
         iotDataWheel[i].supervisorName, 
         iotDataWheel[i].userDocId, 
         iotDataWheel[i].monDocId, 
         iotDataWheel[i].gpsCoord, 
         iotDataWheel[i].distance, 
-        iotDataWheel[i].lines
+        iotDataWheel[i].lines,
+        iotDataWheel[i].timestamp
+        
       );
     }
   }
 }
-// void readReadingsCountFromFlash() {
-//   readIotDataFromFile();
-//   PrintDebug(String("From FILE - Readings Count: ") + String(iotDataCount),
-//              PRINT_FLASH_DEBUG);
-// }
-// void saveReadingsToFlash(Measurement &measure) {
-//   const String data = FLASH_READINGS_DATA + String(readingsCount++);
-
-//   PrintDebug(String("TO FLASH: ") + FLASH_READINGS_DATA +
-//       String(readingsCount) + "," + measure.supervisorName + "," +
-//       measure.operatorName + "," + String(measure.distance) + "," +
-//       String(measure.lines),
-//     PRINT_FLASH_DEBUG);
-
-//   prefs.begin(FLASH_READINGS_KEY, prefs.putBytes(data.c_str(), &measure, sizeof(measure)));
-//   prefs.putUInt("count", readingsCount);
-//   prefs.end();
-// }
-// bool readReadingsFromFlash(const char *key, Measurement &out) {
-//   prefs.begin(FLASH_READINGS_KEY, true);
-  
-//   PrintDebug(String("\nReading key: ") + String(key), PRINT_FLASH_DEBUG);
-//   if (!prefs.isKey(key)) {
-//     prefs.end();
-//     PrintDebug("\nnot a key: ", PRINT_FLASH_DEBUG);
-//     return false;
-//   }
-
-//   size_t len = prefs.getBytes(key, &out, sizeof(out));
-//   if (len != sizeof(out)) {
-//     prefs.end();
-//     return false;
-//   }
-
-//   prefs.end();
-//   return true;
-//}
-// // void getAllReadings(std::vector<Readings> &data) {
-// //   data.clear();
-// //   data.reserve(readingsCount);
-
-// //   for (int i = 0; i < readingsCount; i++) {
-// //     String dataPtr = FLASH_READINGS_DATA + String(i);
-// //     Measurement m;
-
-// //     if (readReadingsFromFlash(dataPtr.c_str(), m)) {
-// //       data.push_back(m);
-
-// //       PrintDebug("\n" + String(dataPtr) + ", " + 
-// //         "monId " + m.monDocId + ", " + 
-// //         "docId " + m.userDocId + ", " + 
-// //         "Supervisor " + m.supervisorName + ", " + 
-// //         "Operator " + m.operatorName + ", " +
-// //         "GPS " + m.gpsCoord + ", " +
-// //         "Distance " + String(m.distance) + ", " + 
-// //         "Lines " + String(m.lines), PRINT_FLASH_DEBUG 
-// //       );
-// //     }
-// //   }
-// // }
-// void deleteReadingsFromFlash() {
-//   prefs.begin(FLASH_READINGS_KEY, true);
-//   prefs.clear();
-//   prefs.end();
-//}
-
-// void readReadingsCountFromFlash() {
-//   prefs.begin(FLASH_READINGS_KEY, true);
-//   size_t count = prefs.getUInt("count", 0);
-//   readingsCount = count;
-//   PrintDebug(String("From FLASH - Readings Count: ") + readingsCount,
-//              PRINT_FLASH_DEBUG);
-//   prefs.end();
-//}
-bool compareString(const char *a, const char *b) {
-  if (!a || !b) {
-    return false;
+void deleteIotDataFile() {
+  if (LittleFS.exists(IOTDATA_FILE)) {
+    LittleFS.remove(IOTDATA_FILE);
+    PrintDebug("Deleted IOT Data file", PRINT_FLASH_DEBUG);
   }
-  while (*a && *b) {
-    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-      return false;
-    }
-    a++;
-    b++;
-  }
-  return *a == '\0' && *b == '\0';
 }
+
 
 void setup() {
   Serial.begin(9600);
@@ -2290,14 +2360,10 @@ void setup() {
     0               // Core 1
   );
 
-  // vTaskSuspend(ConnectWiFiTaskHandle);
   // vTaskResume(GeneralTaskHandle);
   // vTaskResume(IotTaskHandle);
 
   memset(&currentIotDataWheel, 0, sizeof(currentIotDataWheel));
-
-  readSettingsFromFlash();
-  readIotDataFromFile();
  
   // Mount NVS Flash for users
   if (!LittleFS.begin(true)) {
@@ -2316,26 +2382,39 @@ void loop() {
   switch (mainCasePtr) {
 
   // Splash
-  case 0: {
+  case 0: 
     writeLCD("Wheel " + VERSION, "Connecting...");
     startTimout(5);
     readOperatorsFromFile();
-    readIotDataFromFile();
+    readIotDataFile();
+    readSettingsFromFlash();
     mainCasePtr++;
-  } break;
+   break;
 
   // Splash Screen timout
-  case 1: {
-    if (timeoutFlag) {
-      timeoutFlag = false;
+  case 1: 
+  if (timeoutFlag) { 
+    timeoutFlag = false;
       mainCasePtr++;
     }
-  } break;
+   break;
 
   // Ready
   case 2: {
-    if(sessionOpen) writeLCD("Ready", "(Start)(Stop)", true);
-    else writeLCD("Ready", "(Start)", true);
+    if(sessionOpen) {
+      writeLCD(
+        "Ready", 
+        "(Start)(Stop)", 
+        true
+      );
+    } 
+    else {
+      writeLCD(
+        "Ready", 
+        "(Start)", 
+        true
+      );
+    }
 
     oldDistance = 0;
     wheelDistance = 0;
@@ -2349,6 +2428,7 @@ void loop() {
   // - Wait for isPairing Button Press
   // - Wait for Connection request ----------------------------------------
   case 3: {
+   
     // Keep MQTT Alive
     mqttServer.loop();
 
@@ -2357,7 +2437,18 @@ void loop() {
       upKeyPressed = false;
       // saveWifiCredToFlash(ssid, password, serverIP);
       // readWifiCredFromFlash();
-       readIotDataFromFile();
+       readIotDataFile();
+    }
+    if (downKeyPressed) {
+      downKeyPressed = false;
+      deleteIotDataFile();
+      //deleteSessionNrFile();
+    }
+
+    // New Battery Reading
+    if(newBatReadingAvailable){
+      newBatReadingAvailable = false;
+      refreshLCD();
     }
 
     // isPairing
@@ -2419,7 +2510,7 @@ void loop() {
     // New Readings Pushed
     if (newReadingsPushed) {
       newReadingsPushed = false;
-      readIotDataFromFile();
+      readIotDataFile();
       writeLCD("Data Pushed", "");
       startTimout(DISPLAY_TIMEOUT);
       mainCasePtr++;
@@ -2446,7 +2537,11 @@ void loop() {
 
       // (End Session) Confirm
       case 0:{
-        writeLCD("End Session?", "(Ent)(Back)", true);
+        writeLCD(
+          "End Session?", 
+          "(Ent)(Back)", 
+          true
+        );
         subCasePtr++;
       } break;
 
@@ -2460,7 +2555,11 @@ void loop() {
         
         if(enterKeyPressed) {
           enterKeyPressed = false;
-          writeLCD("Supervisor Tag", "(Back)", true);
+          writeLCD(
+            "Supervisor Tag", 
+            "(Back)", 
+            true
+          );
           startTimout(2);
           subCasePtr++;
         }
@@ -2658,13 +2757,13 @@ void loop() {
         } 
       } break;
       
-      // (Session) Start Session
+      // (Open Session) Start Session
       case 2:{
           writeLCD("Supervisor Tag", "(Back)");
           subCasePtr++;
       } break;
       
-      // (Session) Wait Tag / Back
+      // (Open Session) Tag / Back
       case 3:{
 
         if (backKeyPressed) {
@@ -2673,21 +2772,35 @@ void loop() {
           subCasePtr = SUB_CASE_NONE;
         }
         
-        // Tag presented
+        // Supervisor Tag presented
         if (tagPresented) {
-          
-          // Create Session Number - Timestamp
-          snprintf(currentIotDataWheel.session,
-          sizeof(currentIotDataWheel.session),
-          "%llu",
-          static_cast<unsigned long long>(getTimeStamp()));
- 
           tagPresented = false;
+ 
           User user = getUserNameByTag(tagCode);
           
           if(user.name[0]) {
             // Found User
-            strncpy(currentIotDataWheel.supervisorName, user.name, sizeof(currentIotDataWheel.supervisorName) - 1);
+            strncpy(
+              currentIotDataWheel.supervisorName, 
+              user.name, 
+              sizeof(currentIotDataWheel.supervisorName) - 1
+            );
+            
+            if(!compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
+              subCasePtr = 4;
+              break;
+            }
+            
+            String session = createNewSessionNumber();
+
+            // Create Session Number
+            snprintf(
+              currentIotDataWheel.session,
+              sizeof(currentIotDataWheel.session),
+              "%s", session.c_str()
+            );
+            
+            PrintDebug("Session Opened: " + String(currentIotDataWheel.session), PRINT_GENERAL_DEBUG);
             sessionOpen = true;
             subCasePtr = 6;
           } 
@@ -2697,14 +2810,14 @@ void loop() {
         }     
       } break;  
       
-      // (Session) Uknown Tag
+      // (Open Session) Invalid Tag
       case 4:{
-        writeLCD("Unknown Tag", "");
+        writeLCD("Invalid Tag", "");
         startTimout(3);
         subCasePtr++;    
       } break;
       
-      // (Session) Back to Start
+      // (Open Session) Back to Start
       case 5:{
         if (timeoutFlag) {
           timeoutFlag = false;
@@ -2712,14 +2825,14 @@ void loop() {
         }
       } break;
 
-       // (Session) Session Open
+       // (Open Session) Session Open
       case 6:{
         writeLCD("Session Open", currentIotDataWheel.supervisorName);
         startTimout(2);
         subCasePtr++;    
       } break;
       
-      // (Session) Proceed
+      // (Open Session) Proceed
       case 7:{
         if (timeoutFlag) {
           timeoutFlag = false;
@@ -2760,8 +2873,7 @@ void loop() {
           if(user.name[0]) {
             // Found User
             strncpy(currentIotDataWheel.operatorName, user.name, sizeof(currentIotDataWheel.operatorName) - 1);
-            subCasePtr = SUB_CASE_NONE;
-            mainCasePtr++;
+            subCasePtr = 4;
           } 
           else{
             subCasePtr++; // Uknown Tag
@@ -2889,8 +3001,9 @@ void loop() {
           subCasePtr = SUB_CASE_NONE;    
           simulateWheelDistance = false;
 
-          strcpy(nrOfLanesToCut, "");
-          writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
+          laneIndex = 0;
+          memset(nrOfLanesToCut, 0, sizeof(nrOfLanesToCut));
+          writeSetLanesPrompt();
         }
       }  break;
      
@@ -2909,8 +3022,7 @@ void loop() {
 
       if (laneIndex > 0) {
         nrOfLanesToCut[--laneIndex] = '\0';
-
-        writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
+        writeSetLanesPrompt();
       } else {
         mainCasePtr = 23;
       }
@@ -2937,7 +3049,7 @@ void loop() {
         }
       }
 
-      writeLCD("Set Lanes: " + String(nrOfLanesToCut),"(Ent)(Back)");
+      writeSetLanesPrompt();
       key[0] = '\0'; // clear key
     }
   } break;
@@ -2950,19 +3062,32 @@ void loop() {
         if (timeoutFlag) {
           timeoutFlag = false;
           
+          // monId
           strncpy(
             currentIotDataWheel.monDocId, 
             settingsMonDocId,     
             sizeof(currentIotDataWheel.monDocId) - 1
           );
           
+          // userDocId
           strncpy(
             currentIotDataWheel.userDocId, 
             settingsUserDocId,
-            sizeof(currentIotDataWheel.userDocId) - 1);
+            sizeof(currentIotDataWheel.userDocId) - 1
+          );
+
+          time_t t = getTimeStamp();
+          
+          // timestamp
+          strncpy(
+            currentIotDataWheel.timestamp, 
+            ctime(&t),
+            sizeof(currentIotDataWheel.timestamp) - 1
+          );
           
           currentIotDataWheel.monDocId[sizeof(currentIotDataWheel.monDocId) - 1] = '\0';
           currentIotDataWheel.userDocId[sizeof(currentIotDataWheel.userDocId) - 1] = '\0';
+          currentIotDataWheel.timestamp[sizeof(currentIotDataWheel.timestamp) - 1] = '\0';
           currentIotDataWheel.gpsCoord[0] = '\0'; // TODO
 
           writeIotDataToFile(currentIotDataWheel);
@@ -3009,7 +3134,7 @@ void loop() {
     // Wheel Moved
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
-      writeLCD("Distance: " + String(wheelDistance) + "m", "Live");
+      writeLCD("Distance: " + String(wheelDistance) + "m", "Live", false);
       mqttReportLiveIotData();
     }
 
@@ -3034,11 +3159,19 @@ void loop() {
       User user = getUserNameByTag(tagCode);
       if(user.name[0]) {
         // Found User
-        writeLCD(user.name, tag.substring(0, 10));
+        writeLCD(
+          user.name, 
+          tag.substring(0, 10).c_str(),
+          false
+        );
       } 
       else{
         // Found User
-        writeLCD("Unknown Tag", tag.substring(0, 10));
+        writeLCD(
+          "Unknown Tag", 
+          tag.substring(0, 10).c_str(), 
+          false
+        );
       }   
     }
 

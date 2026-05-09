@@ -1,7 +1,8 @@
 {
   "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
   "clangd.arguments": [
-    "--compile-commands-dir=${workspaceFolder}"
+    "--compile-commands-dir=${workspaceFolder}",
+    "--query-driver=C:/Users/MRadyn/.platformio/packages/toolchain-xtensa-esp32/bin/xtensa-esp32-elf-*"
   ],
   "platformio-ide.useBuiltinPIOCore": true,
   "C_Cpp_Runner.msvcBatchPath": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvarsall.bat",
