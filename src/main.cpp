@@ -113,7 +113,7 @@ bool wheelSensor2Low = false;
 
 // MQTT Command
 constexpr size_t JSON_MAX_CMD = 32; // MAX Len
-const String MQTT_CMD_DISCOVER = "#REQ_MONITOR";
+const String MQTT_CMD_DISCOVER = "#DISCOVER";
 const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
 const String MQTT_CMD_CONNECT_MONITOR = "#CONNECT_MONITOR";
 const String MQTT_CMD_DISCONNECT_MONITOR = "#DISCONNECT_MONITOR";
@@ -157,6 +157,7 @@ const String JSON_MEASURE_SESSION = "session";
 const String JSON_TIMESTAMP = "timestamp";
 const String JSON_USER_DOC_ID = "userDocId";
 const String JSON_MON_DOC_ID = "monDocId";
+const String JSON_MON_DEVICE_ID = "monitorId";
 const String JSON_IOT_TYPE = "iotType";
 const String JSON_IOT_NAME = "iotName";
 const String JSON_OPERATORS_VERSION = "operatorsVer";
@@ -844,6 +845,7 @@ void wifiConnectTask(void *parameter) {
         gotPing = false;
         isMqttServiceConnected = true;
 
+        // Sync IOT Settings (Operators)
         mqttSendSync();
 
         wifiCasePtr = 9; // Connection OK
@@ -902,8 +904,7 @@ void wifiConnectTask(void *parameter) {
       
       // Done Pushing Data
       else {
-        PrintDebug(String("DELETE FLASH"), PRINT_WIFI_DEBUG);
-        deleteIotDataFile();
+        //deleteIotDataFile();
         isPushingIotData = false;
         newIotDataPushed = true;
         wifiCasePtr = 9;
@@ -1478,8 +1479,7 @@ void mqttSendSync() {
     return;
   }
 
-  // Distance Wheel
-  // Sync Operarators
+  // Distance Wheel (Sync Operarators)
   if (iotType == IOT_TYPE_WHEEL) {
     JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
     String operateVer = readOperatorVerFile();
@@ -1514,9 +1514,9 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
   JsonVariant _payloadVar = doc[MQTT_JSON_PAYLOAD];
   JsonObject _payloadJson = _payloadVar.as<JsonObject>();
 
-  // -------------------------------------------
-  // Broadcast RX
-  // -------------------------------------------
+  
+  // Broadcast RX --------------------------------------------------------------
+  
   if (_topic == MQTT_TOPIC_TO_IOT) {
     // Pair - Device ID Request
     if (_cmd == MQTT_CMD_DISCOVER) {
@@ -1546,9 +1546,9 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     }
   }
 
-  // -------------------------------------------
-  // Private RX
-  // -------------------------------------------
+  
+  // Private RX ----------------------------------------------------------------
+  
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId) {
     // Live Connection Requested
     if (_cmd == MQTT_CMD_CONNECT_MONITOR) {
@@ -1599,7 +1599,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       // Ticks per Meter
       settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
 
-      // IOT Name
+      // iotName
       const char *iotName = _payloadJson[JSON_IOT_NAME].as<const char *>();
       if (iotName)
         strlcpy(settingsIotName, iotName, sizeof(settingsIotName));
@@ -1771,7 +1771,7 @@ bool mqttPushIotData(int index) {
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
   payload[JSON_MON_DOC_ID] = settingsMonDocId;
   payload[JSON_IOT_TYPE] = settingsIotType;
-  payload[JSON_IOT_NAME] = settingsIotName;
+  payload[JSON_MON_DEVICE_ID] = myDeviceId;
   
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
   return true;
