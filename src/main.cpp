@@ -39,9 +39,12 @@ const int port = 8080;
 #define MS_DELAY 10
 
 #define CASE_PAIR 10
-#define CASE_MEASURE_WHEEL 20
-#define CASE_LIVE_WHEEL_DATA 40
-#define CASE_TAG_PRESENTED 50
+#define CASE_START_WHEEL 20
+#define CASE_OPEN_SESSION 30
+#define CASE_CLOSE_SESSION 40
+#define CASE_CALIBRATE 50
+#define CASE_TAG_PRESENTED 60
+#define CASE_LIVE_WHEEL_DATA 70
 #define CASE_DISPLAY_RETURN_HOME 4
 #define CASE_HOME 2
 
@@ -117,6 +120,7 @@ const String MQTT_CMD_DISCOVER = "#DISCOVER";
 const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
 const String MQTT_CMD_CONNECT_MONITOR = "#CONNECT_MONITOR";
 const String MQTT_CMD_DISCONNECT_MONITOR = "#DISCONNECT_MONITOR";
+const String MQTT_CMD_CALIBRATE = "#CALIBRATE";
 const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
 const String MQTT_CMD_ACK = "#ACK";
 const String MQTT_CMD_PING = "#PING";
@@ -153,6 +157,7 @@ const String JSON_SET_SUPERVISOR = "supervisor";
 const String JSON_SET_TICKS_PER_M = "ticksPerM";
 const String JSON_MEASURE_DISTANCE = "distance";
 const String JSON_MEASURE_LINES = "lines";
+const String JSON_MEASURE_TICKS = "ticks";
 const String JSON_MEASURE_SESSION = "session";
 const String JSON_TIMESTAMP = "timestamp";
 const String JSON_USER_DOC_ID = "userDocId";
@@ -220,6 +225,7 @@ struct IotData_Wheel {
   char gpsCoord[21];  
   float distance;
   int lines;
+  int ticks;
   char timestamp[15]; // 14 chars + \0
 };
 
@@ -228,7 +234,9 @@ IotData_Wheel currentIotDataWheel;
 int iotDataCount = 0;
 int8_t iotDataIndex = 0;
 int session = 0;
-bool sessionOpen = false;
+bool isSessionOpen = false;
+bool isCalibrating = false;
+bool hasNewCalibrateValue = false;
 
 
 // User Tags
@@ -266,8 +274,8 @@ int colPins[COLS] = {KEY_COL1, KEY_COL2, KEY_COL3, KEY_COL4};
 
 const char *keys[ROWS][COLS] = {{"1", "2", "3", "Enter"},
                                 {"4", "5", "6", "Back"},
-                                {"7", "8", "9", "Up"},
-                                {"0", "Start", "Stop", "Down"}};
+                                {"7", "8", "9", "Open"},
+                                {"0", "Start", "Stop", "Close"}};
 
 #define KEY_0 "0"
 #define KEY_1 "1"
@@ -283,14 +291,16 @@ const char *keys[ROWS][COLS] = {{"1", "2", "3", "Enter"},
 #define KEY_STOP "Stop"
 #define KEY_ENTER "Enter"
 #define KEY_BACK "Back"
-#define KEY_UP "Up"
-#define KEY_DOWN "Down"
+#define KEY_OPEN "Open"
+#define KEY_CLOSE "Close"
 #define KEY_PAIR "Stop"
 
 char key[10];
 String prevKey = "";
 int pairModePressCount = 0;
+int calibrateModePressCount = 0;
 #define PAIR_MODE_PRESS_COUNT 5
+#define CALIBRATE_MODE_PRESS_COUNT 5
 
 // Task handle
 TaskHandle_t GeneralTaskHandle = NULL;
@@ -325,18 +335,19 @@ bool startKeyPressed = false;
 bool stopKeyPressed = false;
 bool enterKeyPressed = false;
 bool backKeyPressed = false;
-bool upKeyPressed = false;
-bool downKeyPressed = false;
+bool openKeyPressed = false;
+bool closeKeyPressed = false;
 bool newNumKeyPressed = false;
 bool startPairing = false;
 bool btConnected = false;
 // bool isWifiConnected = false;
 bool isPairing = false;
 bool androidConnected = false;
+bool calibrationMode = false;
 bool androidPaired = false;
 bool newSettingsRecieved = false;
 bool dataACK = false;
-bool isRunning = false;
+bool isRunningLive = false;
 bool iotTypeError = false;
 bool getFirstBatReading = true;
 bool newBatReadingAvailable = false;
@@ -385,7 +396,7 @@ void saveWifiCredToFlash(String ssid, String password, String ip);
 void mqttSendPing();
 void readWifiCredFromFlash();
 String readOperatorVerFile();
-void wrtieOperatorVerToFile(const char *ver);
+void writeOperatorVerToFile(const char *ver);
 void writeOperatorsToFile(const char *operators);
 void readOperatorsFromFile();
 void removeDistancesFromNVM();
@@ -587,22 +598,38 @@ void GeneralTask(void *parameter) {
       PrintDebug(String("Key Pressed: ") + key, PRINT_GENERAL_DEBUG);
 
       // Control
-      if (strcmp(key, KEY_START) == 0)
-        startKeyPressed = true;
-      else if (strcmp(key, KEY_ENTER) == 0)
+      if (strcmp(key, KEY_ENTER) == 0)
         enterKeyPressed = true;
       else if (strcmp(key, KEY_BACK) == 0)
         backKeyPressed = true;
-      else if (strcmp(key, KEY_UP) == 0)
-        upKeyPressed = true;
-      else if (strcmp(key, KEY_DOWN) == 0)
-        downKeyPressed = true;
+      else if (strcmp(key, KEY_OPEN) == 0)
+        openKeyPressed = true;
+      else if (strcmp(key, KEY_CLOSE) == 0)
+        closeKeyPressed = true;
 
-      // Stop / Pair (Press STOP x 5)
+      // Start / Calibration Mode (Press STOP x 6)
+      else if (strcmp(key, KEY_START) == 0) {
+        startKeyPressed = true;
+
+        if (!isSessionOpen && !isRunningLive) {
+          if (calibrateModePressCount == 0) {
+            startTimout(5); // 5 seconds to enter isPairing mode
+          }
+
+          if (calibrateModePressCount++ >= CALIBRATE_MODE_PRESS_COUNT) {
+            calibrateModePressCount = 0;
+            PrintDebug("Calibration MODE", PRINT_GENERAL_DEBUG);
+            calibrationMode = true;
+            startKeyPressed = false;
+          }
+        }
+      }
+
+      // Stop / Pair (Press STOP x 6)
       else if (strcmp(key, KEY_STOP) == 0) {
         stopKeyPressed = true;
 
-        if (!isPairing && !isRunning) {
+        if (!isPairing && !isRunningLive) {
           if (pairModePressCount == 0) {
             startTimout(5); // 5 seconds to enter isPairing mode
           }
@@ -875,8 +902,8 @@ void wifiConnectTask(void *parameter) {
 
       // Push measurements
       // if(readingsCount > 0 && retry != 0) {
-      if (upKeyPressed) {
-        upKeyPressed = false;
+      if (openKeyPressed) {
+        openKeyPressed = false;
         //deleteReadingsFromFlash();
 
         if (iotDataCount > 0) {
@@ -1518,9 +1545,11 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
   // Broadcast RX --------------------------------------------------------------
   
   if (_topic == MQTT_TOPIC_TO_IOT) {
+
     // Pair - Device ID Request
     if (_cmd == MQTT_CMD_DISCOVER) {
       if (isPairing) {
+        
         // IOT Type
         const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
         if (!iotType)
@@ -1550,6 +1579,29 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
   // Private RX ----------------------------------------------------------------
   
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId) {
+    
+    // Calibration Mode
+    if (_cmd == MQTT_CMD_CALIBRATE) {
+      connectedDeviceId = fromDeviceId;
+      wheelTicksCount = 0;
+
+      // Send Confirmation MQTT
+      MqttJsonDoc mqttPacket;
+
+      mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+      mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
+      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_CALIBRATE;
+
+      JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
+      
+      if(hasNewCalibrateValue) payload[JSON_MEASURE_TICKS] = wheelTicksCount;
+      else payload[JSON_MEASURE_TICKS] = 0;
+
+      hasNewCalibrateValue = false;
+      mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+    }
+
     // Live Connection Requested
     if (_cmd == MQTT_CMD_CONNECT_MONITOR) {
       androidConnected = true;
@@ -1665,7 +1717,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       
       // Operator Version
       if (ver) {
-        wrtieOperatorVerToFile(ver);
+        writeOperatorVerToFile(ver);
       }
       
       // Operator List
@@ -1766,6 +1818,7 @@ bool mqttPushIotData(int index) {
   payload[JSON_SET_OPERATOR] = iotDataWheel[index].operatorName;
   payload[JSON_SET_SUPERVISOR] = iotDataWheel[index].supervisorName;
   payload[JSON_MEASURE_LINES] = iotDataWheel[index].lines;
+  payload[JSON_MEASURE_TICKS] = iotDataWheel[index].ticks;
   payload[JSON_TIMESTAMP] = iotDataWheel[index].timestamp;
 
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
@@ -2199,7 +2252,7 @@ void readOperatorsFromFile() {
     return;
   }
 }
-void wrtieOperatorVerToFile(const char *ver) {
+void writeOperatorVerToFile(const char *ver) {
   File f = LittleFS.open(OPERATOR_VER_FILE, "w");
   f.print(ver);
   f.close();
@@ -2280,7 +2333,7 @@ void readIotDataFile() {
     Serial.printf("Loaded %u iotData\n", static_cast<unsigned int>(iotDataCount));
 
     for (int i = 0; i < iotDataCount; i++) {
-      printf("IOT%i: Operator: %s, Supervisor: %s, UserId: %s, MonId: %s, GPS: %s, Distance: %f, Lines: %i, Timestamp: %s\n", 
+      printf("IOT%i: Operator: %s, Supervisor: %s, UserId: %s, MonId: %s, GPS: %s, Distance: %f, Lines: %i, Ticks: %i, Timestamp: %s\n", 
         i, 
         iotDataWheel[i].operatorName, 
         iotDataWheel[i].supervisorName, 
@@ -2289,6 +2342,7 @@ void readIotDataFile() {
         iotDataWheel[i].gpsCoord, 
         iotDataWheel[i].distance, 
         iotDataWheel[i].lines,
+        iotDataWheel[i].ticks,
         iotDataWheel[i].timestamp
         
       );
@@ -2406,26 +2460,25 @@ void loop() {
   switch (mainCasePtr) {
 
   // Splash
-  case 0: 
+  case 0: {
     lcdWrite("Wheel " + VERSION, "Connecting...");
     startTimout(5);
     readOperatorsFromFile();
     readIotDataFile();
     readSettingsFromFlash();
     mainCasePtr++;
-   break;
+  }  break;
 
   // Splash Screen timout
   case 1: 
   if (timeoutFlag) { 
     timeoutFlag = false;
       mainCasePtr++;
-    }
-   break;
+   } break;
 
   // Ready
   case 2: {
-    if(sessionOpen) {
+    if(isSessionOpen) {
       lcdWrite(
         "Ready", 
         "(Start)(Stop)", 
@@ -2434,15 +2487,21 @@ void loop() {
     } 
     else {
       lcdWrite(
-        "Ready", 
-        "(Start)", 
+        "Open Session", 
+        "(Open)", 
         true
       );
     }
 
     oldDistance = 0;
     wheelDistance = 0;
-    isRunning = 0;
+    isRunningLive = false;
+    startKeyPressed = false;
+    stopKeyPressed = false;
+    openKeyPressed  = false;
+    closeKeyPressed = false;
+    backKeyPressed = false;
+    enterKeyPressed = false; 
     mainCasePtr++;
     subCasePtr = SUB_CASE_NONE;
   } break;
@@ -2456,16 +2515,44 @@ void loop() {
     // Keep MQTT Alive
     mqttServer.loop();
 
-    // TESTING
-    if (upKeyPressed) {
-      //upKeyPressed = false;
+     // start Key Pressed
+     if (startKeyPressed) {
+      startKeyPressed = false;
+      
+      if(isSessionOpen){
+        wheelTicksCount = 0;
+        wheelDistance = 0;
+        mainCasePtr = CASE_START_WHEEL;
+        subCasePtr = 0;
+        break;
+      }
+    }
+
+    // stop Key Pressed
+    if (stopKeyPressed) {
+      stopKeyPressed = false;
+      //if(sessionOpen) subCasePtr = 0;
+      break;
+    }
+
+    // Start Session Key Pressed
+    if (openKeyPressed) {
+      openKeyPressed = false;
+      if(!isSessionOpen){
+        mainCasePtr = CASE_OPEN_SESSION;
+      }
       // saveWifiCredToFlash(ssid, password, serverIP);
       // readWifiCredFromFlash();
       //readIotDataFile();
     }
-    if (downKeyPressed) {
-      downKeyPressed = false;
-      deleteIotDataFile();
+
+    // Stop Session Key Pressed
+    if (closeKeyPressed) {
+      closeKeyPressed = false;
+      if(isSessionOpen){
+        mainCasePtr = CASE_CLOSE_SESSION;
+      }
+      //deleteIotDataFile();
       //deleteSessionNrFile();
     }
 
@@ -2483,8 +2570,16 @@ void loop() {
       break;
     }
 
+    // Calibration Mode
+    if (calibrationMode) {
+      calibrationMode = false;
+      mainCasePtr = CASE_CALIBRATE;
+      break;
+    }
+
     // TX Live Data
     if (androidConnected) {
+      androidConnected = false;
       mainCasePtr = CASE_LIVE_WHEEL_DATA;
       break;
     }
@@ -2506,25 +2601,8 @@ void loop() {
       mainCasePtr = CASE_DISPLAY_RETURN_HOME;
     }
 
-    // startKeyPressed
-    if (startKeyPressed) {
-      startKeyPressed = false;
-      wheelTicksCount = 0;
-      wheelDistance = 0;
-      mainCasePtr = 20;
-      subCasePtr = 0;
-      break;
-    }
-
-    // stopKeyPressed
-    if (stopKeyPressed) {
-      stopKeyPressed = false;
-      if(sessionOpen) subCasePtr = 0;
-      break;
-    }
-
     // tag Presented
-    if (tagPresented && !sessionOpen) {
+    if (tagPresented && !isSessionOpen) {
       tagPresented = false;
       mainCasePtr = CASE_TAG_PRESENTED;
       PrintDebug("CasePtr: " + String(mainCasePtr), PRINT_GENERAL_DEBUG);
@@ -2570,105 +2648,6 @@ void loop() {
     } else {
       isWifiConnected = false;
       isMqttServiceConnected = false;
-    }
-
-    // End Session
-    switch (subCasePtr) {
-
-      // (End Session) Confirm
-      case 0:{
-        lcdWrite(
-          "End Session?", 
-          "(Ent)(Back)", 
-          true
-        );
-        subCasePtr++;
-      } break;
-
-      // (End Session) Confirm
-      case 1:{
-        if(backKeyPressed) {
-          backKeyPressed = false;
-          subCasePtr = SUB_CASE_NONE;
-          mainCasePtr = CASE_HOME;
-        }
-        
-        if(enterKeyPressed) {
-          enterKeyPressed = false;
-          lcdWrite(
-            "Supervisor Tag", 
-            "(Back)", 
-            true
-          );
-          startTimout(2);
-          subCasePtr++;
-        }
-      } break;
-
-       // (End Session) Supervisor Tag
-      case 2:{
-          lcdWrite("Super Tag", "(Back)", true);
-          subCasePtr++;
-      } break;
-
-      // (End Session) Confirm
-      case 3: {
-        if(tagPresented){
-          tagPresented = false;
-          
-          User user = getUserNameByTag(tagCode);
-          if(user.accessLevel[0]) {
-            if(compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
-              strncpy(
-                currentIotDataWheel.supervisorName, 
-                user.name, 
-                sizeof(currentIotDataWheel.supervisorName) - 1
-              );
-              sessionOpen = false;
-              subCasePtr = 6;
-            }
-            else{
-              subCasePtr++; // Invalid Tag
-            }
-          }
-          
-          if(backKeyPressed){       
-            subCasePtr = SUB_CASE_NONE;
-            mainCasePtr = CASE_HOME;
-          };
-        }
-      } break;
-
-       // (End Session) Invalid Tag
-      case 4:{
-        lcdWrite("Invalid Tag", "");
-        startTimout(3);
-        subCasePtr++;    
-      } break;
-      
-      // (End Session) Back to Start
-      case 5:{
-        if (timeoutFlag) {
-          timeoutFlag = false;
-          subCasePtr = 2;    
-        }
-      } break;
-
-        // (End Session) Invalid Tag
-      case 6:{
-          lcdWrite("Session Ended", currentIotDataWheel.supervisorName);
-          startTimout(2);
-          subCasePtr++;    
-        } break;
-        
-        // (End Session) Back to Start
-        case 7:{
-          if (timeoutFlag) {
-            timeoutFlag = false;
-            subCasePtr = SUB_CASE_NONE;
-            mainCasePtr = CASE_HOME ;   
-          }
-        } break;
     }
   } break;
 
@@ -2780,16 +2759,12 @@ void loop() {
         if(timeoutFlag) {
           timeoutFlag = false;
           
-          if(sessionOpen){
-            isRunning = true;
+          if(isSessionOpen){
             nrOfLanesToCut[0] = '\0';
             laneIndex = 0;
             tagPresented = false;
             mainCasePtr++;
             subCasePtr = 0;    
-          }
-          else{
-            subCasePtr++;  
           }
         } 
       } break;
@@ -2828,7 +2803,7 @@ void loop() {
               break;
             }
             
-            sessionOpen = true;
+            isSessionOpen = true;
             subCasePtr = 6;
           } 
           else{
@@ -2953,7 +2928,7 @@ void loop() {
       mainCasePtr++;
 
       //DEBUG
-      simulateWheelDistance = true;
+      simulateWheelDistance = false;
       startTimout(1);
       //DEBUG
     }
@@ -3062,6 +3037,7 @@ void loop() {
     else if (enterKeyPressed) {
       enterKeyPressed = false;
       currentIotDataWheel.distance = wheelDistance;
+      currentIotDataWheel.ticks = wheelTicksCount;
       currentIotDataWheel.lines = strtol(nrOfLanesToCut, nullptr, 10);
       mainCasePtr++;
       subCasePtr = 0;
@@ -3084,7 +3060,6 @@ void loop() {
       key[0] = '\0'; // clear key
     }
   } break;
-  
   
   // (Wheel) Save
   case 26: {
@@ -3143,43 +3118,246 @@ void loop() {
     
   } break;
 
+// Open Session ----------------------------------------
 
-  // ----------------------------------------
-  // Live Data
-  // ----------------------------------------
+ // (Open Session) Start Session
+ case 30:{
+  lcdWrite("Supervisor Tag", "(Back)");
+  mainCasePtr++;
+} break;
 
-  case 40: {
-    lcdWrite("Distance: " + String(wheelDistance) + "m", "Live");
-    isRunning = true;
-    oldDistance = 0;
-    wheelDistance = 0;
+// (Open Session) Tag / Back
+case 31:{
+  if (backKeyPressed) {
+    backKeyPressed = false;
+    mainCasePtr = CASE_HOME;
+    subCasePtr = SUB_CASE_NONE;
+  }
+
+  // Supervisor Tag presented
+  if (tagPresented) {
+    tagPresented = false;
+
+    User user = getUserNameByTag(tagCode);
+    
+    if(user.name[0]) {
+      // Found User
+      strncpy(
+        currentIotDataWheel.supervisorName, 
+        user.name, 
+        sizeof(currentIotDataWheel.supervisorName) - 1
+      );
+      
+      if(!compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
+        mainCasePtr = 32;
+        break;
+      }
+      
+      isSessionOpen = true;
+      mainCasePtr = 34; // Proceed - Tag correct
+    } 
+    else{
+      mainCasePtr++; // Uknown Tag
+    }
+  }     
+} break;  
+
+// (Open Session) Invalid Tag
+case 32:{
+  lcdWrite("Invalid Tag", "");
+  startTimout(3);
+  mainCasePtr++;    
+} break;
+
+// (Open Session) Back to Start
+case 33:{
+  if (timeoutFlag) {
+    timeoutFlag = false;
+    mainCasePtr = CASE_OPEN_SESSION;    
+  }
+} break;
+
+// (Open Session) Session Open
+case 34:{
+  lcdWrite("Session Open", currentIotDataWheel.supervisorName);
+  startTimout(2);
+  mainCasePtr++;    
+} break;
+
+// (Open Session) Proceed
+case 35:{
+  if (timeoutFlag) {
+    timeoutFlag = false;
+    subCasePtr = 0;
+    mainCasePtr = CASE_HOME;    
+  }
+} break;
+
+// Close Session ----------------------------------------
+
+  // (End Session) Confirm
+  case 40:{
+    lcdWrite(
+      "End Session?", 
+      "(Ent)(Back)", 
+      true
+    );
     mainCasePtr++;
   } break;
 
-  case 41: {
+  // (End Session) Confirm
+  case 41:{
+    if(backKeyPressed) {
+      backKeyPressed = false;
+      subCasePtr = SUB_CASE_NONE;
+      mainCasePtr = CASE_HOME;
+    }
+    
+    if(enterKeyPressed) {
+      enterKeyPressed = false;
+      lcdWrite(
+        "Supervisor Tag", 
+        "(Back)", 
+        true
+      );
+      startTimout(2);
+      mainCasePtr++;
+    }
+  } break;
+
+   // (End Session) Supervisor Tag
+  case 42:{
+      lcdWrite("Super Tag", "(Back)", true);
+      mainCasePtr++;
+  } break;
+
+  // (End Session) Confirm
+  case 43: {
+    if(tagPresented){
+      tagPresented = false;
+      
+      User user = getUserNameByTag(tagCode);
+      if(user.accessLevel[0]) {
+        if(compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
+          strncpy(
+            currentIotDataWheel.supervisorName, 
+            user.name, 
+            sizeof(currentIotDataWheel.supervisorName) - 1
+          );
+          isSessionOpen = false;
+          mainCasePtr = 46;
+        }
+        else{
+          mainCasePtr++; // Invalid Tag
+        }
+      }
+      
+      if(backKeyPressed){       
+        subCasePtr = SUB_CASE_NONE;
+        mainCasePtr = CASE_HOME;
+      };
+    }
+  } break;
+
+   // (End Session) Invalid Tag
+  case 44:{
+    lcdWrite("Invalid Tag", "");
+    startTimout(3);
+    mainCasePtr++;    
+  } break;
+  
+  // (End Session) Back to Start
+  case 45:{
+    if (timeoutFlag) {
+      timeoutFlag = false;
+      mainCasePtr = 42;    
+    }
+  } break;
+
+    // (End Session) Invalid Tag
+  case 46:{
+      lcdWrite("Session Ended", currentIotDataWheel.supervisorName);
+      startTimout(2);
+      mainCasePtr++;    
+    } break;
+    
+    // (End Session) Back to Start
+    case 47:{
+      if (timeoutFlag) {
+        timeoutFlag = false;
+        subCasePtr = SUB_CASE_NONE;
+        mainCasePtr = CASE_HOME ;   
+      }
+    } break;
+
+  // Calibrate ----------------------------------------
+
+  case 50: {
+    lcdWrite("Calibrate", "(Start)(Back)");
+    hasNewCalibrateValue = false;
+    mainCasePtr++;
+  } break;
+
+  case 51: {
     if (backKeyPressed) {
       backKeyPressed = false;
-      isRunning = false;
+      isCalibrating = false;
       mainCasePtr = CASE_HOME;
+    }
+
+    if (startKeyPressed) {
+      startKeyPressed = false;
+      isCalibrating = true;
+      oldDistance = 0;
+      wheelDistance = 0;
+      wheelTicksCount = 0;
+      mainCasePtr++;
+    }
+  } break;
+
+  case 52: {
+    lcdWrite("Ticks: " + String(wheelTicksCount), "(Back)(Stop)", false);
+    mainCasePtr++;
+  } break;
+
+  case 53: {
+    if (backKeyPressed) {
+      backKeyPressed = false;
+      isCalibrating = false;
+      mainCasePtr = CASE_HOME;
+    }
+
+    if (stopKeyPressed) {
+      stopKeyPressed = false;
+      isCalibrating = false;
+      mainCasePtr++;
     }
 
     // Wheel Moved
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
-      lcdWrite("Distance: " + String(wheelDistance) + "m", "Live", false);
-      mqttReportLiveIotData();
+      lcdWrite("Ticks: " + String(wheelTicksCount), "(Back)(Stop)", false);
     }
+  } break;
 
-    // Android Disconnected
-    if (!androidConnected) {
+  case 54: {
+    lcdWrite("Calibrate END","(Back)", false);
+    hasNewCalibrateValue = true;
+    mainCasePtr++;
+
+  } break;
+
+  case 55: {
+    if (backKeyPressed) {
+      backKeyPressed = false;
+      isCalibrating = false;
       mainCasePtr = CASE_HOME;
     }
   } break;
 
-  // ----------------------------------------
-  // Tag Presented
-  // ----------------------------------------
-  case 50: {
+  // Tag Presented -----------------------------------
+
+  case 60: {
     if (tagCRCError) {
       tagCRCError = false;
       lcdWrite("Tag", "CRC Error");
@@ -3215,13 +3393,44 @@ void loop() {
     mainCasePtr++;
   } break;
 
-  case 51: {
+  case 61: {
     if (timeoutFlag) {
-      mainCasePtr = 2;
+      mainCasePtr = CASE_HOME;
+    }
+  } break;
+
+  // Live Debug -----------------------------------
+
+  case 70: {
+    lcdWrite("Distance: " + String(wheelDistance) + "m", "Live");
+    isRunningLive = true;
+    oldDistance = 0;
+    wheelDistance = 0;
+    mainCasePtr++;
+  } break;
+
+  case 71: {
+    if (backKeyPressed) {
+      backKeyPressed = false;
+      isRunningLive = false;
+      mainCasePtr = CASE_HOME;
+    }
+
+    // Wheel Moved
+    if (oldDistance != wheelDistance) {
+      oldDistance = wheelDistance;
+      lcdWrite("Distance: " + String(wheelDistance) + "m", "Live", false);
+      mqttReportLiveIotData();
+    }
+
+    // Android Disconnected
+    if (!androidConnected) {
+      mainCasePtr = CASE_HOME;
     }
   } break;
 
   default:
     break;
   }
+  
 }
