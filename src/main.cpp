@@ -351,7 +351,7 @@ bool isRunningLive = false;
 bool iotTypeError = false;
 bool getFirstBatReading = true;
 bool newBatReadingAvailable = false;
-bool buzzerTag = false;
+int buzzerOnNrOfBeeps = 0;
 bool showMqttWarning = true;
 
 // Battery
@@ -403,7 +403,7 @@ void removeDistancesFromNVM();
 void loadDistancesFromNVM(std::vector<int> &nums);
 bool readReadingsFromFlash(const char *key, IotData_Wheel &out);
 void mqttReportMyID();
-bool mqttPushIotData(int);
+void mqttPushIotData(int);
 void getAllReadings(std::vector<IotData_Wheel> &data);
 bool wifiCredentialsExist();
 String tagToString(byte *addr);
@@ -469,7 +469,9 @@ void IRAM_ATTR onTimerOneSec() {
   if (runningTime == 0) {
     timeoutFlag = true;
     if(simulateWheelDistance) {
-      wheelDistance += 0.5; // Simulate 0.5 meter every second
+      wheelTicksCount+=11;
+      wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
+      wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
     }else{
       timerAlarmDisable(timer);
     }
@@ -665,7 +667,7 @@ void GeneralTask(void *parameter) {
         // Verify
         if (!tagPresented || memcmp(lastTagCode, tagCode, 8) != 0) {
           tagPresented = true;
-          buzzerTag = true;
+          buzzerOnNrOfBeeps = 3;
           memcpy(lastTagCode, tagCode, 8);
 
           String tag = tagToString(tagCode);
@@ -675,15 +677,12 @@ void GeneralTask(void *parameter) {
     }
 
     // Tag Buzzer
-    if (buzzerTag) {
+    if (buzzerOnNrOfBeeps > 0) {
       digitalWrite(BUZZER, HIGH);
       vTaskDelay(100 / portTICK_PERIOD_MS);
       digitalWrite(BUZZER, LOW);
       vTaskDelay(100 / portTICK_PERIOD_MS);
-      digitalWrite(BUZZER, HIGH);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      digitalWrite(BUZZER, LOW);
-      buzzerTag = false;
+      buzzerOnNrOfBeeps--;
     }
 
     // Tag LED Blink
@@ -711,12 +710,14 @@ void GeneralTask(void *parameter) {
       
       int adcValue = analogRead(ADC_BATTERY);
       batteryLevel = map(adcValue, 0, 3800, 0, 100); // Assuming a 12-bit ADC (3800 Max count)
-      if (batteryLevel > 100) batteryLevel = 100; // Cap at 100%
+      if (batteryLevel > 100){
+        batteryLevel = 100; // Cap at 100%
+      } 
       newBatReadingAvailable = true;
 
-      PrintDebug("Battery Level: " + String(adcValue) + " (" +
+      //PrintDebug("Battery Level: " + String(adcValue) + " (" +
                      String(batteryLevel) + "%)",
-                 PRINT_GENERAL_DEBUG);
+      //           PRINT_GENERAL_DEBUG);
     }
 
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -871,12 +872,11 @@ void wifiConnectTask(void *parameter) {
         PrintDebug("PING ACK", PRINT_WIFI_DEBUG);
         gotPing = false;
         isMqttServiceConnected = true;
-
+        
         // Sync IOT Settings (Operators)
         mqttSendSync();
-
-        wifiCasePtr = 9; // Connection OK
-      } else if (timeoutFlag) {
+      } 
+      else if (timeoutFlag) {
         PrintDebug("PING TIMEOUT", PRINT_WIFI_DEBUG);
         timeoutFlag = false;
         retry--;
@@ -888,6 +888,7 @@ void wifiConnectTask(void *parameter) {
           wifiCasePtr = 7; // Retry ping
         }
       }
+      retry = 3; // push IOT data retry 
       wifiCasePtr++;
     } break;
 
@@ -901,15 +902,16 @@ void wifiConnectTask(void *parameter) {
       }
 
       // Push measurements
-      // if(readingsCount > 0 && retry != 0) {
-      if (openKeyPressed) {
-        openKeyPressed = false;
-        //deleteReadingsFromFlash();
-
-        if (iotDataCount > 0) {
-          iotDataIndex = iotDataCount - 1;
-          retry = 3;
-          wifiCasePtr = 20;
+       if (newNumKeyPressed) {
+         newNumKeyPressed = false;
+    
+         if(strcmp(key, KEY_0) == 0)
+         {
+          if (iotDataCount > 0 && retry > 0) {
+            timeoutFlag = false;
+            iotDataIndex = iotDataCount - 1;
+            wifiCasePtr = 20;
+          }
         }
       }
 
@@ -920,25 +922,30 @@ void wifiConnectTask(void *parameter) {
     case 20: {
       mqttServer.loop(); // Keep MQTT Alive
 
-      // Pushing Data
       if (iotDataIndex > -1) {
+        // Pushing Data to MQTT
+        
         PrintDebug(String("Pushing Measurement: ") + String(iotDataIndex), PRINT_WIFI_DEBUG);
         isPushingIotData = true;
+        
         mqttPushIotData(iotDataIndex);
-        startTimout(5);
+        startTimout(5); // Timeout
         wifiCasePtr++;
-      } 
-      
-      // Done Pushing Data
+      }      
       else {
-        //deleteIotDataFile();
+        // Finished Pushing Data
+        deleteIotDataFile();
+
         isPushingIotData = false;
         newIotDataPushed = true;
+        retry = 3; // Push IOT data retry 
         wifiCasePtr = 9;
       }
     } break;
 
     case 21: {
+      mqttServer.loop(); // Keep MQTT going
+
       // Timeout (No Reply)
       if (timeoutFlag) {
         timeoutFlag = false;
@@ -1801,7 +1808,7 @@ void mqttReportMyID() {
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
-bool mqttPushIotData(int index) {
+void mqttPushIotData(int index) {
   //std::vector<Measurement> measurements;
   //getAllReadings(readings);
 
@@ -1827,7 +1834,6 @@ bool mqttPushIotData(int index) {
   payload[JSON_MON_DEVICE_ID] = myDeviceId;
   
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-  return true;
 }
 
 // Wifi
@@ -2487,7 +2493,7 @@ void loop() {
     } 
     else {
       lcdWrite(
-        "Open Session", 
+        "No Session", 
         "(Open)", 
         true
       );
@@ -2539,10 +2545,12 @@ void loop() {
     if (openKeyPressed) {
       openKeyPressed = false;
       if(!isSessionOpen){
-        mainCasePtr = CASE_OPEN_SESSION;
+       mainCasePtr = CASE_OPEN_SESSION;
       }
-      // saveWifiCredToFlash(ssid, password, serverIP);
-      // readWifiCredFromFlash();
+      
+      //deleteReadingsFromFlash();  
+      //saveWifiCredToFlash(ssid, password, serverIP);
+      //readWifiCredFromFlash();
       //readIotDataFile();
     }
 
@@ -2561,7 +2569,7 @@ void loop() {
       newBatReadingAvailable = false;
       lcdRefresh();
     }
-
+    
     // isPairing
     if (startPairing) {
       startPairing = false;
@@ -2613,15 +2621,17 @@ void loop() {
     if (newIotDataPushed) {
       newIotDataPushed = false;
       readIotDataFile();
-      lcdWrite("Success", "");
+      lcdWrite("Cloud Sync", "DONE");
       startTimout(DISPLAY_TIMEOUT);
+      buzzerOnNrOfBeeps = 3;
       mainCasePtr++;
     }
 
     // Pushing IOT Data...
     if (isPushingIotData) {
       isPushingIotData = false;
-      lcdWrite("Cloud Sync", "");
+      buzzerOnNrOfBeeps = 1;
+      lcdWrite("Cloud Sync", "Busy ...");
       startTimout(DISPLAY_TIMEOUT);
       mainCasePtr++;
     }
