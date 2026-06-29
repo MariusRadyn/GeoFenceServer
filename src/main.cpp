@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <esp_random.h>
 
 const String VERSION = "V1.0";
 
@@ -130,6 +131,8 @@ const String MQTT_CMD_IOT_DATA = "#IOT_DATA";
 const String MQTT_CMD_SETTINGS = "#REQ_SETTINGS";
 const String MQTT_CMD_SYNC = "#SYNC";
 const String MQTT_CMD_OPERATORS = "#OPERATORS";
+const String MQTT_CMD_NEW_DATA_AVAILABLE = "#NEW_DATA_AVAILABLE";
+
 
 // MQTT Topics
 constexpr size_t JSON_MAX_TOPIC = 32; // MAX Len
@@ -163,6 +166,7 @@ const String JSON_TIMESTAMP = "timestamp";
 const String JSON_USER_DOC_ID = "userDocId";
 const String JSON_MON_DOC_ID = "monDocId";
 const String JSON_MON_DEVICE_ID = "monitorId";
+const String JSON_IOT_WRITE_ID = "iotWriteId";
 const String JSON_IOT_TYPE = "iotType";
 const String JSON_IOT_NAME = "iotName";
 const String JSON_OPERATORS_VERSION = "operatorsVer";
@@ -181,6 +185,8 @@ const char *FLASH_SETTINGS = "settings";
 const char *FLASH_WIFI_CRED = "wifi";
 
 #define MQTT_PAYLOAD_MAX 512
+#define MQTT_RX_BUFFER_SIZE 12288
+#define MAX_OPERATORS_JSON_SIZE 12288
 using MqttJsonDoc =
     StaticJsonDocument<JSON_OBJECT_SIZE(5) +        // root
                        JSON_OBJECT_SIZE(2) +        // payload
@@ -227,6 +233,7 @@ struct IotData_Wheel {
   int lines;
   int ticks;
   char timestamp[15]; // 14 chars + \0
+  char iotWriteId[33]; // 32 chars + \0
 };
 
 IotData_Wheel iotDataWheel [MAX_MEASURE];
@@ -353,6 +360,7 @@ bool getFirstBatReading = true;
 bool newBatReadingAvailable = false;
 int buzzerOnNrOfBeeps = 0;
 bool showMqttWarning = true;
+volatile bool pendingOperatorsUpdate = false;
 
 // Battery
 int batteryLevel = 0; // Percentage
@@ -370,6 +378,7 @@ bool simulateWheelDistance = false;
 // LittleFS Filenames
 const String OPERATOR_VER_FILE = "/operators_version.bin";
 const String OPERATORS_FILE = "/operators.bin";
+const String OPERATORS_JSON_FILE = "/operators.json";
 const String IOTDATA_FILE = "/iotdata.bin";
 const String SESSION_NR_FILE = "/session_nr.bin";  // only used when time is not set
 
@@ -396,18 +405,24 @@ void saveWifiCredToFlash(String ssid, String password, String ip);
 void mqttSendPing();
 void readWifiCredFromFlash();
 String readOperatorVerFile();
-void writeOperatorVerToFile(const char *ver);
-void writeOperatorsToFile(const char *operators);
+void saveOperatorVerToFile(const char *ver);
+void loadOperatorsFromJsonArray(JsonArray operatorsArray);
+void saveOperatorsToFile();
+void queueOperatorsUpdate(JsonArray operatorsArray);
+void processPendingOperatorsUpdate();
+void saveOperatorsToFile(const char *operators);
 void readOperatorsFromFile();
 void removeDistancesFromNVM();
 void loadDistancesFromNVM(std::vector<int> &nums);
 bool readReadingsFromFlash(const char *key, IotData_Wheel &out);
 void mqttReportMyID();
 void mqttPushIotData(int);
+void uuid4_hex(char out[33]);
 void getAllReadings(std::vector<IotData_Wheel> &data);
 bool wifiCredentialsExist();
 String tagToString(byte *addr);
 void mqttSendSync();
+void mqttServiceLoop();
 String GetMacAddress();
 String readSessionNrFromFile() ;
 void writeSessionNrToFile(const char *session);
@@ -572,20 +587,25 @@ void GeneralTask(void *parameter) {
         digitalWrite(LED_WIFI_CONNECTED, LOW);
 
       // Green
+      static bool wasPairing = false;
       if (isPairing) {
+        if (!wasPairing) {
+          wasPairing = true;
+          delay = 0;
+          ledMqttState = true;
+        }
         if (delay++ >= 700) {
           delay = 0;
           ledMqttState = !ledMqttState;
-
-          if (ledMqttState)
-            digitalWrite(LED_MQTT_CONNECTED, HIGH); // Green
-          else
-            digitalWrite(LED_MQTT_CONNECTED, LOW);
         }
-      } else if (!isPairing && isMqttServiceConnected)
-        digitalWrite(LED_MQTT_CONNECTED, HIGH);
-      // else
-      // digitalWrite(LED_MQTT_CONNECTED, LOW);
+        digitalWrite(LED_MQTT_CONNECTED, ledMqttState ? HIGH : LOW);
+      } else {
+        wasPairing = false;
+        if (isMqttServiceConnected)
+          digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        else
+          digitalWrite(LED_MQTT_CONNECTED, LOW);
+      }
     }
 
     // Keypad
@@ -676,7 +696,7 @@ void GeneralTask(void *parameter) {
       }
     }
 
-    // Tag Buzzer
+    // Buzzer
     if (buzzerOnNrOfBeeps > 0) {
       digitalWrite(BUZZER, HIGH);
       vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -715,9 +735,9 @@ void GeneralTask(void *parameter) {
       } 
       newBatReadingAvailable = true;
 
-      //PrintDebug("Battery Level: " + String(adcValue) + " (" +
-                     String(batteryLevel) + "%)",
-      //           PRINT_GENERAL_DEBUG);
+      // PrintDebug("Battery Level: " + String(adcValue) + " (" +
+      //            String(batteryLevel) + "%)",
+      //            PRINT_GENERAL_DEBUG);
     }
 
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -755,7 +775,8 @@ void wifiConnectTask(void *parameter) {
         WiFi.begin(ssid, password);
         PrintDebug("Got Credentials, Start Wifi ", PRINT_WIFI_DEBUG);
         wifiCasePtr = 3;
-      }else{
+      }
+      else{
         // Use Bluetooth Connection
         startTimout(5);
         wifiCasePtr++;  
@@ -816,13 +837,12 @@ void wifiConnectTask(void *parameter) {
 
     // Connecting MQTT
     case 5: {
-      mqttServer.setBufferSize(512);
+      mqttServer.setBufferSize(MQTT_RX_BUFFER_SIZE);
 
       if (mqttServer.connect(myDeviceId.c_str())) {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
 
-        mqttServer.loop();
-        digitalWrite(LED_MQTT_CONNECTED, HIGH); // Green
+        mqttServiceLoop();
         mqttReportMyID();
         showMqttWarning = true;
 
@@ -866,17 +886,18 @@ void wifiConnectTask(void *parameter) {
 
     // Wait Base Response
     case 8: {
-      mqttServer.loop(); // Keep MQTT Alive
+      mqttServiceLoop(); // Keep MQTT Alive
 
       if (gotPing) {
         PrintDebug("PING ACK", PRINT_WIFI_DEBUG);
         gotPing = false;
         isMqttServiceConnected = true;
-        
+
         // Sync IOT Settings (Operators)
         mqttSendSync();
-      } 
-      else if (timeoutFlag) {
+        retry = 3; // Push IOT data retry
+        wifiCasePtr = 9;
+      } else if (timeoutFlag) {
         PrintDebug("PING TIMEOUT", PRINT_WIFI_DEBUG);
         timeoutFlag = false;
         retry--;
@@ -884,17 +905,18 @@ void wifiConnectTask(void *parameter) {
         if (retry <= 0) {
           PrintDebug("Connection Failed after retries", PRINT_WIFI_DEBUG);
           wifiCasePtr = 0; // Restart connection
-        } else {
+        } 
+        else {
           wifiCasePtr = 7; // Retry ping
         }
       }
-      retry = 3; // push IOT data retry 
-      wifiCasePtr++;
+
+      vTaskDelay(10 / portTICK_PERIOD_MS);
     } break;
 
     // IDLE
     case 9: {
-      mqttServer.loop(); // Keep MQTT Alive
+      mqttServiceLoop(); // Keep MQTT Alive
 
       if (WiFi.status() != WL_CONNECTED) {
         PrintDebug("Lost WIFI Connection", PRINT_WIFI_DEBUG);
@@ -902,10 +924,10 @@ void wifiConnectTask(void *parameter) {
       }
 
       // Push measurements
-       if (newNumKeyPressed) {
-         newNumKeyPressed = false;
+      if (newNumKeyPressed) {
+        newNumKeyPressed = false;
     
-         if(strcmp(key, KEY_0) == 0)
+        if(strcmp(key, KEY_0) == 0)
          {
           if (iotDataCount > 0 && retry > 0) {
             timeoutFlag = false;
@@ -920,7 +942,7 @@ void wifiConnectTask(void *parameter) {
 
     // -- Push Measurements ----------------------------------------------
     case 20: {
-      mqttServer.loop(); // Keep MQTT Alive
+      mqttServiceLoop(); // Keep MQTT Alive
 
       if (iotDataIndex > -1) {
         // Pushing Data to MQTT
@@ -934,7 +956,7 @@ void wifiConnectTask(void *parameter) {
       }      
       else {
         // Finished Pushing Data
-        deleteIotDataFile();
+        //deleteIotDataFile();
 
         isPushingIotData = false;
         newIotDataPushed = true;
@@ -944,7 +966,7 @@ void wifiConnectTask(void *parameter) {
     } break;
 
     case 21: {
-      mqttServer.loop(); // Keep MQTT going
+      mqttServiceLoop(); // Keep MQTT going
 
       // Timeout (No Reply)
       if (timeoutFlag) {
@@ -1528,12 +1550,24 @@ void mqttSendSync() {
     PrintDebug("Sync Error: Unknown IOT Type: " + iotType, PRINT_ERRORS);
   }
 }
+void mqttServiceLoop() {
+  mqttServer.loop();
+  if (pendingOperatorsUpdate) {
+    processPendingOperatorsUpdate();
+  }
+}
 void mqttRx(char *topic, byte *payload, unsigned int length) {
   Serial.print("MQTT RX: ");
   Serial.write(payload, length);
   Serial.println();
 
-  StaticJsonDocument<2048> doc;
+  if (length > MQTT_RX_BUFFER_SIZE) {
+    PrintDebug("MQTT RX payload too large", PRINT_ERRORS);
+    return;
+  }
+
+  const size_t docSize = length + 512;
+  DynamicJsonDocument doc(docSize < 1024 ? 1024 : docSize);
   DeserializationError error = deserializeJson(doc, payload, length);
   if (error) {
     Serial.print("JSON parse failed: ");
@@ -1580,9 +1614,25 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
         mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
       }
     }
-  }
-
   
+    // New Data is available
+    // Trigger #SYNC
+    if (_cmd == MQTT_CMD_NEW_DATA_AVAILABLE) {
+    
+      // IOT Type
+      const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
+      if (!iotType)
+        return;
+
+      if (strcmp(iotType, IOT_TYPE_WHEEL) == 0) {
+        mqttSendSync();
+      }
+      else{
+        PrintDebug("Unknown IOT Type: " + String(iotType), PRINT_ERRORS);
+      }
+    }
+
+  }  
   // Private RX ----------------------------------------------------------------
   
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId) {
@@ -1714,23 +1764,13 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
       const char *ver = _payloadJson[JSON_OPERATORS_VERSION].as<const char *>();
       JsonArray operatorsArray = _payloadJson[JSON_OPERATORS_LIST];
-      String operatorsStr;
-      
-      if (!operatorsArray.isNull()) {
-        serializeJson(operatorsArray, operatorsStr);
+
+      if (ver) {
+        saveOperatorVerToFile(ver);
       }
 
-      const char *operators = operatorsStr.c_str();
-      
-      // Operator Version
-      if (ver) {
-        writeOperatorVerToFile(ver);
-      }
-      
-      // Operator List
-      if (operators && strlen(operators) > 0) {
-        writeOperatorsToFile(operators);
-        readOperatorsFromFile();
+      if (!operatorsArray.isNull()) {
+        queueOperatorsUpdate(operatorsArray);
       }
     }
   }
@@ -1808,10 +1848,17 @@ void mqttReportMyID() {
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
-void mqttPushIotData(int index) {
-  //std::vector<Measurement> measurements;
-  //getAllReadings(readings);
+void uuid4_hex(char out[33]) {
+  uint8_t bytes[16];
+  esp_fill_random(bytes, sizeof(bytes));
+  bytes[6] = (bytes[6] & 0x0F) | 0x40;
+  bytes[8] = (bytes[8] & 0x3F) | 0x80;
 
+  for (int i = 0; i < 16; i++) {
+    snprintf(out + i * 2, 3, "%02x", bytes[i]);
+  }
+}
+void mqttPushIotData(int index) {
   MqttJsonDoc mqttPacket;
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
   mqttPacket[MQTT_JSON_TO_DEVICE_ID] = connectedDeviceId;
@@ -1827,7 +1874,8 @@ void mqttPushIotData(int index) {
   payload[JSON_MEASURE_LINES] = iotDataWheel[index].lines;
   payload[JSON_MEASURE_TICKS] = iotDataWheel[index].ticks;
   payload[JSON_TIMESTAMP] = iotDataWheel[index].timestamp;
-
+  payload[JSON_IOT_WRITE_ID] = iotDataWheel[index].iotWriteId;
+  
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
   payload[JSON_MON_DOC_ID] = settingsMonDocId;
   payload[JSON_IOT_TYPE] = settingsIotType;
@@ -1835,7 +1883,6 @@ void mqttPushIotData(int index) {
   
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
-
 // Wifi
 void wifiScanNetwork() {
   int n = WiFi.scanNetworks();
@@ -2122,7 +2169,146 @@ void deleteSessionNrFile() {
 }
 
 // Read/Write File (Operators)
-void writeOperatorsToFile(const char *operators) {
+void loadOperatorsFromJsonArray(JsonArray operatorsArray) {
+  userCount = 0;
+  for (JsonVariant v : operatorsArray) {
+    if (userCount >= MAX_USERS) {
+      maxUsersReached = true;
+      break;
+    }
+
+    String s_fullName;
+    String s_access;
+    const char *tag = nullptr;
+
+    if (v.is<JsonObject>()) {
+      JsonObject opObj = v.as<JsonObject>();
+
+      const char *firstName = opObj[JSON_OPERATOR_NAME];
+      const char *surname = opObj[JSON_OPERATOR_SURNAME];
+      const char *access = opObj[JSON_OPERATOR_ACCESS_LEVEL];
+      tag = opObj[JSON_OPERATOR_TAG_ID];
+
+      if (firstName) {
+        s_fullName = String(firstName);
+
+        if (surname && strlen(surname) > 0) {
+          s_fullName += " ";
+          s_fullName += surname;
+        }
+
+        if (strlen(s_fullName.c_str()) > 29) {
+          s_fullName = s_fullName.substring(0, 29);
+        }
+      }
+
+      if (access) {
+        s_access = String(access);
+
+        if (s_access.length() > 29) {
+          s_access = s_access.substring(0, 29);
+        }
+      }
+    } else if (v.is<const char *>()) {
+      tag = v.as<const char *>();
+    }
+
+    if (!tag)
+      continue;
+
+    if (!parseTagString(tag, users[userCount].tag)) {
+      PrintDebug(String("Invalid operator tag: ") + tag, PRINT_ERRORS);
+      continue;
+    }
+
+    if (s_fullName.length() > 0) {
+      strncpy(users[userCount].name, s_fullName.c_str(),
+              sizeof(users[userCount].name) - 1);
+      users[userCount].name[sizeof(users[userCount].name) - 1] = '\0';
+    } else {
+      users[userCount].name[0] = '\0';
+    }
+
+    if (s_access.length() > 0) {
+      strncpy(users[userCount].accessLevel, s_access.c_str(),
+              sizeof(users[userCount].accessLevel) - 1);
+      users[userCount].accessLevel[sizeof(users[userCount].accessLevel) - 1] =
+          '\0';
+    } else {
+      users[userCount].accessLevel[0] = '\0';
+    }
+    userCount++;
+  }
+}
+void saveOperatorsToFile() {
+  File f = LittleFS.open(OPERATORS_FILE, "w");
+  for (uint16_t i = 0; i < userCount; i++) {
+    f.write((uint8_t *)&users[i], sizeof(User));
+  }
+  f.close();
+
+  PrintDebug(String("Saved Operators to file: ") + String(userCount) + " users",
+             PRINT_GENERAL_DEBUG);
+}
+void queueOperatorsUpdate(JsonArray operatorsArray) {
+  File f = LittleFS.open(OPERATORS_JSON_FILE, "w");
+  if (!f) {
+    PrintDebug("Failed to queue operators JSON", PRINT_ERRORS);
+    return;
+  }
+
+  if (serializeJson(operatorsArray, f) == 0) {
+    f.close();
+    LittleFS.remove(OPERATORS_JSON_FILE);
+    PrintDebug("Failed to serialize operators JSON", PRINT_ERRORS);
+    return;
+  }
+
+  f.close();
+  pendingOperatorsUpdate = true;
+}
+void processPendingOperatorsUpdate() {
+  pendingOperatorsUpdate = false;
+
+  if (!LittleFS.exists(OPERATORS_JSON_FILE)) {
+    return;
+  }
+
+  File f = LittleFS.open(OPERATORS_JSON_FILE, "r");
+  if (!f) {
+    PrintDebug("Failed to open queued operators JSON", PRINT_ERRORS);
+    return;
+  }
+
+  const size_t fileSize = f.size();
+  if (fileSize == 0 || fileSize > MAX_OPERATORS_JSON_SIZE) {
+    f.close();
+    LittleFS.remove(OPERATORS_JSON_FILE);
+    PrintDebug("Queued operators JSON invalid size", PRINT_ERRORS);
+    return;
+  }
+
+  DynamicJsonDocument doc(fileSize + 256);
+  const DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  LittleFS.remove(OPERATORS_JSON_FILE);
+
+  if (err) {
+    PrintDebug(String("Queued operators JSON parse failed: ") + err.c_str(),
+               PRINT_ERRORS);
+    return;
+  }
+
+  JsonArray operatorsArray = doc.as<JsonArray>();
+  if (operatorsArray.isNull()) {
+    PrintDebug("Queued operators JSON is not an array", PRINT_ERRORS);
+    return;
+  }
+
+  loadOperatorsFromJsonArray(operatorsArray);
+  saveOperatorsToFile();
+}
+void saveOperatorsToFile(const char *operators) {
 
   if (operators && strlen(operators) > 0) {
     DynamicJsonDocument doc(strlen(operators) + 256);
@@ -2142,86 +2328,9 @@ void writeOperatorsToFile(const char *operators) {
       return;
     }
 
-    userCount = 0;
-    for (JsonVariant v : operatorsArray) {
-      if (userCount >= MAX_USERS) {
-        maxUsersReached = true;
-        break;
-      }
-
-      String s_fullName;
-      String s_access;
-      const char *tag = nullptr;
-
-      if (v.is<JsonObject>()) {    
-        JsonObject opObj = v.as<JsonObject>();
-
-        const char *firstName = opObj[JSON_OPERATOR_NAME];
-        const char *surname = opObj[JSON_OPERATOR_SURNAME];
-        const char *access = opObj[JSON_OPERATOR_ACCESS_LEVEL];
-        tag = opObj[JSON_OPERATOR_TAG_ID];
-        
-        if (firstName) {
-          s_fullName = String(firstName);
-
-          if (surname && strlen(surname) > 0) {
-            s_fullName += " ";
-            s_fullName += surname;
-          }
-
-          if(strlen(s_fullName.c_str()) > 29) {
-            s_fullName = s_fullName.substring(0, 29);
-          }
-        }
-
-        if (access) {
-          s_access = String(access);
-
-          if(s_access.length() > 29) {
-            s_access = s_access.substring(0, 29);
-          }
-        }
-      } 
-      else if (v.is<const char *>()) {
-        tag = v.as<const char *>();
-      }
-
-      if (!tag)
-        continue;
-
-      if (!parseTagString(tag, users[userCount].tag)) {
-        PrintDebug(String("Invalid operator tag: ") + tag, PRINT_ERRORS);
-        continue;
-      }
-
-      if (s_fullName.length() > 0) {
-        strncpy(users[userCount].name, s_fullName.c_str(), sizeof(users[userCount].name) - 1);
-        users[userCount].name[sizeof(users[userCount].name) - 1] = '\0';
-      } 
-      else {
-        users[userCount].name[0] = '\0';
-      }
-
-      if (s_access.length() > 0) {
-        strncpy(users[userCount].accessLevel, s_access.c_str(), sizeof(users[userCount].accessLevel) - 1);
-        users[userCount].accessLevel[sizeof(users[userCount].accessLevel) - 1] = '\0';
-      } 
-      else {
-        users[userCount].accessLevel[0] = '\0';
-      }
-      userCount++;
-    }
+    loadOperatorsFromJsonArray(operatorsArray);
+    saveOperatorsToFile();
   }
-
-  File f = LittleFS.open(OPERATORS_FILE, "w");
-  for (uint16_t i = 0; i < userCount; i++) {
-    f.write((uint8_t *)&users[i], sizeof(User));
-  }
-  f.close();
-
-  PrintDebug(String("Saved Operators to file: ") + String(userCount) + " users",
-             PRINT_GENERAL_DEBUG);
-  
 }
 void readOperatorsFromFile() {
   try {
@@ -2258,7 +2367,7 @@ void readOperatorsFromFile() {
     return;
   }
 }
-void writeOperatorVerToFile(const char *ver) {
+void saveOperatorVerToFile(const char *ver) {
   File f = LittleFS.open(OPERATOR_VER_FILE, "w");
   f.print(ver);
   f.close();
@@ -2428,7 +2537,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(wifiConnectTask,
     "ConnectWiFiTask",      // Task name
-    7000,                   // Stack size (bytes)
+    12288,                  // Stack size (bytes)
     NULL,                   // Parameters
     1,                      // Priority
     &ConnectWiFiTaskHandle, // Task handle
@@ -2515,11 +2624,11 @@ void loop() {
   // Home (Idle):
   // ----------------------------------------------------------------
   // - Wait for isPairing Button Press
-  // - Wait for Connection request ----------------------------------------
+  // - Wait for Connection request 
   case 3: {
    
     // Keep MQTT Alive
-    mqttServer.loop();
+    mqttServiceLoop();
 
      // start Key Pressed
      if (startKeyPressed) {
@@ -2547,11 +2656,6 @@ void loop() {
       if(!isSessionOpen){
        mainCasePtr = CASE_OPEN_SESSION;
       }
-      
-      //deleteReadingsFromFlash();  
-      //saveWifiCredToFlash(ssid, password, serverIP);
-      //readWifiCredFromFlash();
-      //readIotDataFile();
     }
 
     // Stop Session Key Pressed
@@ -2560,8 +2664,6 @@ void loop() {
       if(isSessionOpen){
         mainCasePtr = CASE_CLOSE_SESSION;
       }
-      //deleteIotDataFile();
-      //deleteSessionNrFile();
     }
 
     // New Battery Reading
@@ -2623,7 +2725,7 @@ void loop() {
       readIotDataFile();
       lcdWrite("Cloud Sync", "DONE");
       startTimout(DISPLAY_TIMEOUT);
-      buzzerOnNrOfBeeps = 3;
+      buzzerOnNrOfBeeps = 2;
       mainCasePtr++;
     }
 
@@ -2673,7 +2775,7 @@ void loop() {
   
   case 10: {
     // Keep MQTT Alive
-    mqttServer.loop();
+    mqttServiceLoop();
 
     if (!isWifiConnected) {
       lcdWrite("Pairing ...", "No WiFi");
@@ -3106,6 +3208,7 @@ void loop() {
           currentIotDataWheel.userDocId[sizeof(currentIotDataWheel.userDocId) - 1] = '\0';
           currentIotDataWheel.timestamp[sizeof(currentIotDataWheel.timestamp) - 1] = '\0';
           currentIotDataWheel.gpsCoord[0] = '\0'; // TODO
+          uuid4_hex(currentIotDataWheel.iotWriteId);
 
           writeIotDataToFile(currentIotDataWheel);
           lcdWrite(String(wheelDistance) + "m X " + String(nrOfLanesToCut),currentIotDataWheel.operatorName);
@@ -3371,7 +3474,8 @@ case 35:{
     if (tagCRCError) {
       tagCRCError = false;
       lcdWrite("Tag", "CRC Error");
-    } else {
+    } 
+    else {
       PrintDebug("CasePtr: " + String(mainCasePtr), PRINT_GENERAL_DEBUG);
 
       String tag = tagToString(tagCode);
