@@ -17,7 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <esp_random.h>
+#include <vector>
+#include <driver/gpio.h>
 
 const String VERSION = "V1.0";
 
@@ -31,6 +32,8 @@ WiFiClient wifiClient;
 PubSubClient mqttServer(wifiClient);
 String ssid = "";
 String password = "";
+String mqttUser = "";
+String mqttPassword = "";
 char serverIP[16];
 const int port = 8080;
 
@@ -46,6 +49,7 @@ const int port = 8080;
 #define CASE_CALIBRATE 50
 #define CASE_TAG_PRESENTED 60
 #define CASE_LIVE_WHEEL_DATA 70
+#define CASE_FACTORY_RESET 80
 #define CASE_DISPLAY_RETURN_HOME 4
 #define CASE_HOME 2
 
@@ -67,6 +71,8 @@ constexpr const char *FLASH_SET_MONITOR_DOC_ID = "monDocId";
 constexpr const char *FLASH_WIFI_SSID = "ssid";
 constexpr const char *FLASH_WIFI_PASSWORD = "pw";
 constexpr const char *FLASH_WIFI_IP = "ip";
+constexpr const char *FLASH_MQTT_USER = "mqttUser";
+constexpr const char *FLASH_MQTT_PASSWORD = "mqttPw";
 
 char settingsIotType[32] = {0};
 char settingsIotName[32] = {0};
@@ -89,7 +95,12 @@ int wheelTicksCount = 0;
 
 // Commands
 const String CMD_SHARED_WIFI_CREDENTIALS =
-    "wificred:"; // Format: wificred:ssid#password
+    "wificred:"; // Format: wificred:ssid>password>ip>mqttUser>mqttPassword
+const String CMD_BT_PAIRING = "PAIRING";
+const String CMD_BT_IDLE = "IDLE";
+const String CMD_BT_WIFI_OK = "WIFI_OK";
+const String CMD_BT_SHOESH = "SHOESH"; // Base reject: stop MQTT to this broker
+bool mqttBlockedByBase = false;        // set by SHOESH; cleared on pair / new creds
 
 // Button Debounce
 volatile bool debPairFallEdge = false;
@@ -175,6 +186,9 @@ const String JSON_OPERATOR_NAME = "name";
 const String JSON_OPERATOR_SURNAME = "surname";
 const String JSON_OPERATOR_TAG_ID = "tagId";
 const String JSON_OPERATOR_ACCESS_LEVEL = "accessLevel";
+const String JSON_DOC_ID = "docId";
+const String JSON_OPERATOR_DOC_ID = "operatorDocId";
+const String JSON_SUPERVISOR_DOC_ID = "supervisorDocId";
 
 const char * ACCESS_LEVEL_SUPERVISOR = "supervisor";
 const char * ACCESS_LEVEL_OPERATOR = "operator";
@@ -224,6 +238,8 @@ using MqttJsonDoc =
 // IOT Readings
 #define MAX_MEASURE 100
 struct IotData_Wheel {
+  char operatorDocId[21];  
+  char supervisorDocId[21];  
   char operatorName[17];   // 16 chars + \0
   char supervisorName[17];
   char userDocId[29]; // 28 + \0 
@@ -249,6 +265,7 @@ bool hasNewCalibrateValue = false;
 // User Tags
 struct User {
   uint8_t tag[8];
+  char docId[21];
   char name[30];
   char accessLevel[30];
 };
@@ -268,6 +285,8 @@ LiquidCrystal_I2C lcd_i2c(0x27, 16,
                           2); // I2C address 0x27, 16 column and 2 rows
 char lcdLine1[17] = {0};
 char lcdLine2[17] = {0};
+bool lcdShowMeasureCnt = false;
+bool lcdHasContent = false;
 
 // Keypad
 const int ROWS = 4;
@@ -306,8 +325,10 @@ char key[10];
 String prevKey = "";
 int pairModePressCount = 0;
 int calibrateModePressCount = 0;
+int factoryResetPressCount = 0;
 #define PAIR_MODE_PRESS_COUNT 5
 #define CALIBRATE_MODE_PRESS_COUNT 5
+#define FACTORY_RESET_PRESS_COUNT 5
 
 // Task handle
 TaskHandle_t GeneralTaskHandle = NULL;
@@ -315,7 +336,7 @@ TaskHandle_t ConnectWiFiTaskHandle = NULL;
 TaskHandle_t IotTaskHandle = NULL;
 
 // Bluetooth
-#define PAIR_TIMEOUT 20   // seconds
+#define PAIR_TIMEOUT 60   // seconds (BT creds + WiFi + MQTT + discover)
 #define DISPLAY_TIMEOUT 2 // seconds
 #define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
 #define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
@@ -326,6 +347,7 @@ NimBLEService *pService = nullptr;
 
 int runningTime = 0; // seconds
 bool time_1sec_Flag = false;
+unsigned long pingDeadlineMs = 0;
 String connectedDeviceId;
 String myDeviceId;
 String fromDeviceId;
@@ -346,9 +368,11 @@ bool openKeyPressed = false;
 bool closeKeyPressed = false;
 bool newNumKeyPressed = false;
 bool startPairing = false;
+bool startFactoryReset = false;
 bool btConnected = false;
 // bool isWifiConnected = false;
 bool isPairing = false;
+bool btWifiOkNotified = false;
 bool androidConnected = false;
 bool calibrationMode = false;
 bool androidPaired = false;
@@ -359,6 +383,8 @@ bool iotTypeError = false;
 bool getFirstBatReading = true;
 bool newBatReadingAvailable = false;
 int buzzerOnNrOfBeeps = 0;
+int buzzerOnTime = 0;
+int buzzerOffTime = 0;
 bool showMqttWarning = true;
 volatile bool pendingOperatorsUpdate = false;
 
@@ -393,6 +419,7 @@ void DebounceWheelSensor2();
 void bt_StopServer();
 void bt_StartServer();
 void bt_StartAdvertising();
+void bt_NotifyStatus(const String &status);
 void mqttTX(const JsonDocument &msg, const String &topic);
 void mqttRx(char *topic, byte *payload, unsigned int length);
 void PrintDebug(String, bool);
@@ -400,9 +427,16 @@ void lcdWrite(const char *line1, const char *line2);
 void lcdWrite(const char *line1, const char *line2, bool showMeasureCnt);
 void lcdRefresh();
 bool getKeypad(char *out, size_t outSize);
+void keypadInit();
 void saveDistancesToNVM(int value);
-void saveWifiCredToFlash(String ssid, String password, String ip);
+void saveWifiCredToFlash(String ssid, String password, String ip, String mqttUser,
+                         String mqttPassword);
+void deleteWifiCredFromFlash();
+void deleteSettingsFromFlash();
+void deleteOperatorsData();
+void factoryReset();
 void mqttSendPing();
+bool mqttConnect();
 void readWifiCredFromFlash();
 String readOperatorVerFile();
 void saveOperatorVerToFile(const char *ver);
@@ -498,6 +532,8 @@ void startTimout(int seconds) {
   runningTime = seconds;
   timeoutFlag = false;
   pairModePressCount = 0;
+  calibrateModePressCount = 0;
+  factoryResetPressCount = 0;
   timerAlarmEnable(timer);
 }
 
@@ -586,7 +622,7 @@ void GeneralTask(void *parameter) {
       else
         digitalWrite(LED_WIFI_CONNECTED, LOW);
 
-      // Green
+      // Green — blink while pairing; solid when MQTT/base ping is up
       static bool wasPairing = false;
       if (isPairing) {
         if (!wasPairing) {
@@ -622,8 +658,24 @@ void GeneralTask(void *parameter) {
       // Control
       if (strcmp(key, KEY_ENTER) == 0)
         enterKeyPressed = true;
-      else if (strcmp(key, KEY_BACK) == 0)
+      else if (strcmp(key, KEY_BACK) == 0) {
         backKeyPressed = true;
+
+        // Factory reset: BACK x 5 on home only
+        if ((mainCasePtr == CASE_HOME || mainCasePtr == 3) &&
+            !isSessionOpen && !isRunningLive && !isPairing) {
+          if (factoryResetPressCount == 0) {
+            startTimout(5);
+          }
+
+          if (factoryResetPressCount++ >= FACTORY_RESET_PRESS_COUNT) {
+            factoryResetPressCount = 0;
+            PrintDebug("Factory Reset MODE", PRINT_GENERAL_DEBUG);
+            startFactoryReset = true;
+            backKeyPressed = false;
+          }
+        }
+      }
       else if (strcmp(key, KEY_OPEN) == 0)
         openKeyPressed = true;
       else if (strcmp(key, KEY_CLOSE) == 0)
@@ -687,7 +739,9 @@ void GeneralTask(void *parameter) {
         // Verify
         if (!tagPresented || memcmp(lastTagCode, tagCode, 8) != 0) {
           tagPresented = true;
-          buzzerOnNrOfBeeps = 3;
+          buzzerOnNrOfBeeps = 2;
+          buzzerOnTime = 100;
+          buzzerOffTime = 100;
           memcpy(lastTagCode, tagCode, 8);
 
           String tag = tagToString(tagCode);
@@ -699,9 +753,9 @@ void GeneralTask(void *parameter) {
     // Buzzer
     if (buzzerOnNrOfBeeps > 0) {
       digitalWrite(BUZZER, HIGH);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+      vTaskDelay(buzzerOnTime / portTICK_PERIOD_MS);
       digitalWrite(BUZZER, LOW);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+      vTaskDelay(buzzerOffTime / portTICK_PERIOD_MS);
       buzzerOnNrOfBeeps--;
     }
 
@@ -801,7 +855,9 @@ void wifiConnectTask(void *parameter) {
     // Wait for Wifi Credentials via Bluetooth
     case 2: {
       if (gotWifiCredentials) {
-        // Start WiFi Connection
+        PrintDebug("Got Wifi Credentials ... ", PRINT_WIFI_DEBUG);
+        PrintDebug("SSID: " + ssid, PRINT_WIFI_DEBUG);
+       
         isWifiConnected = false;
         isMqttServiceConnected = false;
         wifiCasePtr++;
@@ -810,6 +866,8 @@ void wifiConnectTask(void *parameter) {
 
     // Connecting Wifi
     case 3: {
+       // Start WiFi Connection
+      PrintDebug("Connecting to Wifi ... ", PRINT_WIFI_DEBUG);
       WiFi.begin(ssid, password);
       wifiCasePtr++;
     } break;
@@ -837,9 +895,14 @@ void wifiConnectTask(void *parameter) {
 
     // Connecting MQTT
     case 5: {
+      if (mqttBlockedByBase) {
+        wifiCasePtr = 15;
+        break;
+      }
+
       mqttServer.setBufferSize(MQTT_RX_BUFFER_SIZE);
 
-      if (mqttServer.connect(myDeviceId.c_str())) {
+      if (mqttConnect()) {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
 
         mqttServiceLoop();
@@ -879,34 +942,48 @@ void wifiConnectTask(void *parameter) {
 
     // Ping Base Station
     case 7: {
+      if (mqttBlockedByBase) {
+        wifiCasePtr = 15;
+        break;
+      }
       mqttSendPing();
-      startTimout(2);
+      // Dedicated ping deadline — do NOT use startTimout() (shared with pairing UI)
+      pingDeadlineMs = millis() + (isPairing ? 8000UL : 2000UL);
       wifiCasePtr++;
     } break;
 
     // Wait Base Response
     case 8: {
+      if (mqttBlockedByBase) {
+        wifiCasePtr = 15;
+        break;
+      }
       mqttServiceLoop(); // Keep MQTT Alive
 
       if (gotPing) {
         PrintDebug("PING ACK", PRINT_WIFI_DEBUG);
         gotPing = false;
         isMqttServiceConnected = true;
+        digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        pingDeadlineMs = 0;
 
         // Sync IOT Settings (Operators)
         mqttSendSync();
         retry = 3; // Push IOT data retry
         wifiCasePtr = 9;
-      } else if (timeoutFlag) {
+      } else if (pingDeadlineMs != 0 && (long)(millis() - pingDeadlineMs) >= 0) {
         PrintDebug("PING TIMEOUT", PRINT_WIFI_DEBUG);
-        timeoutFlag = false;
+        pingDeadlineMs = 0;
         retry--;
 
         if (retry <= 0) {
           PrintDebug("Connection Failed after retries", PRINT_WIFI_DEBUG);
-          wifiCasePtr = 0; // Restart connection
-        } 
-        else {
+          // MQTT-only retry — do not tear down BLE (NimBLE deinit while a
+          // client is connected can InstrFetchProhibited / PC=0).
+          PrintDebug("Retry MQTT without BLE restart", PRINT_WIFI_DEBUG);
+          retry = 3;
+          wifiCasePtr = 5;
+        } else {
           wifiCasePtr = 7; // Retry ping
         }
       }
@@ -916,32 +993,69 @@ void wifiConnectTask(void *parameter) {
 
     // IDLE
     case 9: {
+      if (mqttBlockedByBase) {
+        wifiCasePtr = 15;
+        break;
+      }
       mqttServiceLoop(); // Keep MQTT Alive
 
       if (WiFi.status() != WL_CONNECTED) {
         PrintDebug("Lost WIFI Connection", PRINT_WIFI_DEBUG);
+        isMqttServiceConnected = false;
         wifiCasePtr = 0; // Restart connection
+      } else if (!mqttServer.connected()) {
+        PrintDebug("Lost MQTT Connection", PRINT_WIFI_DEBUG);
+        isMqttServiceConnected = false;
+        wifiCasePtr = 5; // Reconnect MQTT
       }
 
       // Push measurements
+      //if (iotDataCount > 0 && !isSessionOpen) {
+      //  wifiCasePtr = 20;
+      //}
+
+      // Push Manually
       if (newNumKeyPressed) {
         newNumKeyPressed = false;
     
         if(strcmp(key, KEY_0) == 0)
-         {
-          if (iotDataCount > 0 && retry > 0) {
-            timeoutFlag = false;
-            iotDataIndex = iotDataCount - 1;
-            wifiCasePtr = 20;
-          }
+        {
+          wifiCasePtr = 20;
         }
       }
-
+      
       vTaskDelay(500 / portTICK_PERIOD_MS);
+    } break;
+
+    // Base rejected via BLE SHOESH — keep WiFi/BLE, do not MQTT until pair/new creds
+    case 15: {
+      if (!mqttBlockedByBase) {
+        // Cleared by pairing start or new wificred
+        if (!ssid.isEmpty() && !password.isEmpty()) {
+          wifiCasePtr = 3;
+        } else {
+          wifiCasePtr = 1;
+        }
+      } else if (isPairing) {
+        mqttBlockedByBase = false;
+        wifiCasePtr = 5;
+      }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
     } break;
 
     // -- Push Measurements ----------------------------------------------
     case 20: {
+      if (iotDataCount > 0 && retry > 0) {
+        timeoutFlag = false;
+        iotDataIndex = iotDataCount - 1;
+        wifiCasePtr++;
+      }
+      else {
+        wifiCasePtr = 9;
+      }
+    } break;
+
+    case 21: {
       mqttServiceLoop(); // Keep MQTT Alive
 
       if (iotDataIndex > -1) {
@@ -956,7 +1070,7 @@ void wifiConnectTask(void *parameter) {
       }      
       else {
         // Finished Pushing Data
-        //deleteIotDataFile();
+        deleteIotDataFile();
 
         isPushingIotData = false;
         newIotDataPushed = true;
@@ -965,7 +1079,7 @@ void wifiConnectTask(void *parameter) {
       }
     } break;
 
-    case 21: {
+    case 22: {
       mqttServiceLoop(); // Keep MQTT going
 
       // Timeout (No Reply)
@@ -975,7 +1089,7 @@ void wifiConnectTask(void *parameter) {
         if (retry > 0) {
           // Retry
           retry--;
-          wifiCasePtr = 20;
+          wifiCasePtr = 21;
           PrintDebug(String("RETRY"), PRINT_WIFI_DEBUG);
         }
         else{
@@ -990,11 +1104,10 @@ void wifiConnectTask(void *parameter) {
       if (dataACK) {
         dataACK = false;
         iotDataIndex--;
-        wifiCasePtr = 20;
+        wifiCasePtr = 21;
       }
-    }
-
-    break;
+    } break;
+    
     default:
       break;
     }
@@ -1367,6 +1480,11 @@ void lcdWrite(const char* line1, const char* line2, bool showMeasureCnt) {
   char percent[6];  // " 100%"
   char measureCount[7];  // " (999)"
 
+  strlcpy(lcdLine1, line1 ? line1 : "", sizeof(lcdLine1));
+  strlcpy(lcdLine2, line2 ? line2 : "", sizeof(lcdLine2));
+  lcdShowMeasureCnt = showMeasureCnt;
+  lcdHasContent = true;
+
   // Format Measurements Count safely
   snprintf(measureCount, sizeof(measureCount), " (%d)", iotDataCount);
 
@@ -1410,6 +1528,11 @@ void lcdWrite(const char* line1, const char* line2) {
   char buffer1[17];
   char buffer2[17];
   char percent[6];  // " 100%"
+
+  strlcpy(lcdLine1, line1 ? line1 : "", sizeof(lcdLine1));
+  strlcpy(lcdLine2, line2 ? line2 : "", sizeof(lcdLine2));
+  lcdShowMeasureCnt = false;
+  lcdHasContent = true;
   
   // Format percent safely
   snprintf(percent, sizeof(percent), " %d%%", batteryLevel);
@@ -1446,51 +1569,18 @@ void lcdWrite(String line1, String line2, bool showMeasureCnt) {
 void lcdSetLanesPrompt() {
   char laneLine[17];
   snprintf(laneLine, sizeof(laneLine), "Set Lanes: %s", nrOfLanesToCut);
-  lcdWrite(laneLine, "(Ent)(Back)");
+  lcdWrite(laneLine, "(Ent,Back)");
 }
 void lcdRefresh() {
-  if (lcdLine1[0] == '\0' || lcdLine2[0] == '\0') return;
-
-  char line2[17];  // final output (16 chars + null)
-
-  // Format: text left + percent right-aligned
-  snprintf(
-    line2, 
-    sizeof(line2), 
-    "%-11.11s %3d%%", lcdLine2, batteryLevel
-  );
-
-  lcd_i2c.setCursor(0, 0);
-  lcd_i2c.print("                ");
-  lcd_i2c.setCursor(0, 0);
-  lcd_i2c.print(lcdLine1);
-
-  lcd_i2c.setCursor(0, 1);
-  lcd_i2c.print("                ");
-  lcd_i2c.setCursor(0, 1);
-  lcd_i2c.print(line2);
-}
-bool getKeypad(char *out, size_t outSize) {
-  for (int r = 0; r < ROWS; r++) {
-    digitalWrite(rowPins[r], LOW);
-
-    for (int c = 0; c < COLS; c++) {
-      if (digitalRead(colPins[c]) == LOW) {
-        delay(20);
-        while (digitalRead(colPins[c]) == LOW)
-          ;
-        digitalWrite(rowPins[r], HIGH);
-
-        const char *src = keys[r][c];
-        strncpy(out, src, outSize - 1);
-        out[outSize - 1] = '\0'; // always terminate
-
-        return true;
-      }
-    }
-    digitalWrite(rowPins[r], HIGH);
+  if (!lcdHasContent) {
+    return;
   }
-  return false;
+
+  if (lcdShowMeasureCnt) {
+    lcdWrite(lcdLine1, lcdLine2, true);
+  } else {
+    lcdWrite(lcdLine1, lcdLine2);
+  }
 }
 bool compareString(const char *a, const char *b) {
   if (!a || !b) {
@@ -1505,8 +1595,86 @@ bool compareString(const char *a, const char *b) {
   }
   return *a == '\0' && *b == '\0';
 }
+void buzzerOn(int nrOfBeeps, int onTime, int offTime) {
+  buzzerOnNrOfBeeps = nrOfBeeps;
+  buzzerOnTime = onTime;
+  buzzerOffTime = offTime;
+}
+void keypadInit() {
+  // Let strapping pins (GPIO 0, 2, 5) settle after boot — required on DevKitC.
+  delay(100);
 
-// MQTT
+  for (int c = 0; c < COLS; c++) {
+    gpio_reset_pin((gpio_num_t)colPins[c]);
+    pinMode(colPins[c], OUTPUT);
+    digitalWrite(colPins[c], HIGH);
+  }
+  for (int r = 0; r < ROWS; r++) {
+    gpio_reset_pin((gpio_num_t)rowPins[r]);
+    pinMode(rowPins[r], INPUT_PULLUP);
+  }
+}
+bool getKeypad(char *out, size_t outSize) {
+  for (int c = 0; c < COLS; c++) {
+    for (int i = 0; i < COLS; i++) {
+      digitalWrite(colPins[i], i == c ? LOW : HIGH);
+    }
+    delayMicroseconds(100);
+
+    int pressedRow = -1;
+    for (int r = 0; r < ROWS; r++) {
+      if (digitalRead(rowPins[r]) == LOW) {
+        if (pressedRow != -1) {
+          pressedRow = -1;
+          break;
+        }
+        pressedRow = r;
+      }
+    }
+
+    if (pressedRow < 0) {
+      continue;
+    }
+
+    delay(20);
+    if (digitalRead(rowPins[pressedRow]) != LOW) {
+      continue;
+    }
+
+    int confirmRow = -1;
+    for (int r = 0; r < ROWS; r++) {
+      if (digitalRead(rowPins[r]) == LOW) {
+        if (confirmRow != -1) {
+          confirmRow = -1;
+          break;
+        }
+        confirmRow = r;
+      }
+    }
+
+    if (confirmRow != pressedRow) {
+      continue;
+    }
+
+    while (digitalRead(rowPins[pressedRow]) == LOW) {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+
+    for (int i = 0; i < COLS; i++) {
+      digitalWrite(colPins[i], HIGH);
+    }
+
+    const char *src = keys[pressedRow][c];
+    strncpy(out, src, outSize - 1);
+    out[outSize - 1] = '\0';
+    return true;
+  }
+
+  for (int i = 0; i < COLS; i++) {
+    digitalWrite(colPins[i], HIGH);
+  }
+  return false;
+}
 void mqttSendPing() {
   gotPing = false;
   MqttJsonDoc mqttPacket;
@@ -1633,6 +1801,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     }
 
   }  
+
   // Private RX ----------------------------------------------------------------
   
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId) {
@@ -1775,6 +1944,13 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     }
   }
 }
+bool mqttConnect() {
+  if (!mqttUser.isEmpty()) {
+    return mqttServer.connect(myDeviceId.c_str(), mqttUser.c_str(),
+                              mqttPassword.c_str());
+  }
+  return mqttServer.connect(myDeviceId.c_str());
+}
 void mqttTX(const JsonDocument &msg, const String &topic) {
   if (!isWifiConnected) {
     Serial.println("WiFi not connected");
@@ -1878,11 +2054,15 @@ void mqttPushIotData(int index) {
   
   payload[JSON_USER_DOC_ID] = settingsUserDocId;
   payload[JSON_MON_DOC_ID] = settingsMonDocId;
+  payload[JSON_OPERATOR_DOC_ID] = iotDataWheel[index].operatorDocId;
+  payload[JSON_SUPERVISOR_DOC_ID] = iotDataWheel[index].supervisorDocId;
   payload[JSON_IOT_TYPE] = settingsIotType;
+  payload[JSON_MON_DEVICE_ID] = myDeviceId;
   payload[JSON_MON_DEVICE_ID] = myDeviceId;
   
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
+
 // Wifi
 void wifiScanNetwork() {
   int n = WiFi.scanNetworks();
@@ -1913,10 +2093,14 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) {
     PrintDebug("BT Client connected", PRINT_BT_DEBUG);
     isBluetoothConnected = true;
+
+    // If already in pair mode, tell the base immediately
+    if (isPairing) {
+      bt_NotifyStatus(CMD_BT_PAIRING);
+    }
   }
 
-  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo,
-                    int reason) {
+  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) {
     Serial.printf("BT Client disconnected: %s \n",
                   connInfo.getAddress().toString().c_str());
     NimBLEDevice::startAdvertising();
@@ -1924,10 +2108,29 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
   }
 };
 class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic *pCharacteristic,
-               NimBLEConnInfo &connInfo) {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     String rxData = pCharacteristic->getValue();
     PrintDebug("BT Rx " + String(rxData), PRINT_BT_DEBUG);
+
+    // Base reject: not paired — stop MQTT to this broker (keep BLE for pairing)
+    if (rxData.equalsIgnoreCase(CMD_BT_SHOESH) ||
+        rxData.startsWith(CMD_BT_SHOESH)) {
+      if (isPairing) {
+        PrintDebug("BT SHOESH ignored (pairing)", PRINT_BT_DEBUG);
+        return;
+      }
+      mqttBlockedByBase = true;
+      gotPing = false;
+      pingDeadlineMs = 0;
+      isMqttServiceConnected = false;
+      digitalWrite(LED_MQTT_CONNECTED, LOW);
+      if (mqttServer.connected()) {
+        mqttServer.disconnect();
+      }
+      wifiCasePtr = 15;
+      PrintDebug("BT SHOESH: MQTT stopped to this base", PRINT_BT_DEBUG);
+      return;
+    }
 
     // Recieved WiFi Credentials
     if (rxData.startsWith(CMD_SHARED_WIFI_CREDENTIALS)) {
@@ -1936,22 +2139,27 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
 
       int i1 = rxData.indexOf(">");
       int i2 = rxData.indexOf(">", i1 + 1);
+      int i3 = rxData.indexOf(">", i2 + 1);
+      int i4 = rxData.indexOf(">", i3 + 1);
 
-      if (i1 != -1 && i2 != -1) {
+      if (i1 != -1 && i2 != -1 && i3 != -1 && i4 != -1) {
         String newSsid = rxData.substring(0, i1);
         String newPassword = rxData.substring(i1 + 1, i2);
+        String newMqttUser = rxData.substring(i3 + 1, i4);
+        String newMqttPassword = rxData.substring(i4 + 1);
         char newIP[16] = "";
         bool newIPMatch = false;
 
-        // Set Global IP address part
-        String ip = rxData.substring(i2 + 1);
-        ip.toCharArray(newIP, sizeof(serverIP));
-        strcmp(serverIP, newIP) == 0 ? newIPMatch = true : newIPMatch = false;
+        String ip = rxData.substring(i2 + 1, i3);
+        ip.toCharArray(newIP, sizeof(newIP));
+        newIPMatch = (strcmp(serverIP, newIP) == 0);
 
-        if (password != newPassword || ssid != newSsid || !newIPMatch) {
-          saveWifiCredToFlash(newSsid, newPassword, newIP);
+        if (password != newPassword || ssid != newSsid || !newIPMatch || mqttPassword != newMqttPassword || mqttUser != newMqttUser) {
+          saveWifiCredToFlash(newSsid, newPassword, newIP, newMqttUser, newMqttPassword);
           ssid = newSsid;
           password = newPassword;
+          mqttUser = newMqttUser;
+          mqttPassword = newMqttPassword;
           strlcpy(serverIP, newIP, sizeof(serverIP));
           PrintDebug("Save Wifi Credentials", PRINT_WIFI_DEBUG);
         } else {
@@ -1962,28 +2170,63 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         // PrintDebug("Password: " + password, PRINT_CREDENTIALS_DEBUG);
 
         gotWifiCredentials = true;
+        // New / re-provisioned creds — allow MQTT again after SHOESH
+        mqttBlockedByBase = false;
+
+        // Tell base once to stop resending credentials (frees BT RF for MQTT)
+        if (isPairing && !btWifiOkNotified) {
+          btWifiOkNotified = true;
+          bt_NotifyStatus(CMD_BT_WIFI_OK);
+        }
       } else {
         PrintDebug("Invalid WiFi credentials format: " + rxData, PRINT_ERRORS);
         Serial.println();
       }
     }
   }
-  void onSubscribe(NimBLECharacteristic *pCharacteristic,
-                   NimBLEConnInfo &connInfo, uint16_t subValue) override {
-    // Raspberry PI Subscribed to notifications
+  void onSubscribe(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo, uint16_t subValue) override {
     Serial.println("\n");
+    if (subValue == 0) {
+      PrintDebug("BT Client unsubscribed from notifications", PRINT_BT_DEBUG);
+      return;
+    }
+
     PrintDebug("BT Client subscribed to notifications", PRINT_BT_DEBUG);
+
+    // Base is listening — push current pairing state
+    if (isPairing) {
+      bt_NotifyStatus(CMD_BT_PAIRING);
+    } else {
+      bt_NotifyStatus(CMD_BT_IDLE);
+    }
   }
 };
+void bt_NotifyStatus(const String &status) {
+  if (pChar == nullptr) {
+    return;
+  }
+
+  pChar->setValue(status.c_str());
+  pChar->notify();
+  PrintDebug("BT Tx " + status, PRINT_BT_DEBUG);
+}
 void bt_StopServer() {
   if (pServer != nullptr) {
     PrintDebug("Stopping existing BLE server...", PRINT_BT_DEBUG);
     NimBLEDevice::stopAdvertising();
-    pServer->removeService(pService);
-    pService = nullptr;
+    // Drop connected peers before deinit to avoid dangling NimBLE callbacks
+    // (InstrFetchProhibited / PC=0 when deinit races a disconnect notify).
+    if (pServer->getConnectedCount() > 0) {
+      std::vector<uint16_t> peers = pServer->getPeerDevices();
+      for (uint16_t connId : peers) {
+        pServer->disconnect(connId);
+      }
+      delay(200);
+    }
     pChar = nullptr;
-    NimBLEDevice::deinit(true); // fully shuts down BLE
+    pService = nullptr;
     pServer = nullptr;
+    NimBLEDevice::deinit(true);
     delay(100);
   }
 }
@@ -2003,7 +2246,7 @@ void bt_StartServer() {
       CHAR_UUID,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
   pChar->setCallbacks(new BT_HandshakeCallbacks());
-  pChar->setValue("IDLE");
+  pChar->setValue(CMD_BT_IDLE.c_str());
   pService->start();
 
   PrintDebug((String("BT Server Started: ") + myDeviceId), PRINT_BT_DEBUG);
@@ -2021,11 +2264,10 @@ void bt_StartAdvertising() {
   pAdv->setScanResponseData(scanResp);
 
   NimBLEDevice::startAdvertising();
-  PrintDebug((String("BT Advertising Started:  ") + myDeviceId),
-             PRINT_BT_DEBUG);
+  PrintDebug((String("BT Advertising Started:  ") + myDeviceId), PRINT_BT_DEBUG);
 }
 
-// Read/Write Prevs
+// Read/Write Prevs (Credentials)
 void saveSettingsToFlash() {
   char _iotType[32];
   char _iotName[32];
@@ -2086,22 +2328,124 @@ void readSettingsFromFlash() {
                  String(": ") + settingsMonDocId,
              PRINT_FLASH_DEBUG);
 
+  // Already paired if monitor settings were saved previously
+  androidPaired = (settingsMonDocId[0] != '\0');
+
   prefs.end();
 }
-void saveWifiCredToFlash(String ssid, String password, String ip) {
+void saveWifiCredToFlash(String ssid, String password, String ip, String mqttUser, String mqttPassword) {
   PrintDebug("Writing WIFI Cred", PRINT_FLASH_DEBUG);
 
   prefs.begin(FLASH_WIFI_CRED, false);
   prefs.putString(FLASH_WIFI_SSID, ssid.c_str());
   prefs.putString(FLASH_WIFI_PASSWORD, password.c_str());
   prefs.putString(FLASH_WIFI_IP, ip.c_str());
+  prefs.putString(FLASH_MQTT_USER, mqttUser.c_str());
+  prefs.putString(FLASH_MQTT_PASSWORD, mqttPassword.c_str());
   prefs.end();
 
   PrintDebug(String("Save WIFI Cred to FLASH -  ") + FLASH_WIFI_SSID +
                  String(": ") + ssid + ", " + FLASH_WIFI_PASSWORD +
-                 String(": ") + password + ", " + FLASH_WIFI_IP + String(": ") +
-                 ip,
+                 String(": ") + password + ", " + FLASH_WIFI_IP + String(": ") +  ip + ", " + FLASH_MQTT_USER + 
+                 String(": ") + mqttUser + ", " + FLASH_MQTT_PASSWORD + String(": ") + mqttPassword,
              PRINT_FLASH_DEBUG);
+}
+void deleteWifiCredFromFlash() {
+  PrintDebug("Deleting WIFI Cred from FLASH", PRINT_FLASH_DEBUG);
+
+  prefs.begin(FLASH_WIFI_CRED, false);
+  prefs.clear();
+  prefs.end();
+
+  ssid = "";
+  password = "";
+  mqttUser = "";
+  mqttPassword = "";
+  serverIP[0] = '\0';
+  gotWifiCredentials = false;
+
+  PrintDebug("WIFI Cred deleted", PRINT_FLASH_DEBUG);
+}
+void deleteSettingsFromFlash() {
+  PrintDebug("Deleting Settings from FLASH", PRINT_FLASH_DEBUG);
+
+  prefs.begin(FLASH_SETTINGS, false);
+  prefs.clear();
+  prefs.end();
+
+  settingsIotType[0] = '\0';
+  settingsIotName[0] = '\0';
+  settingsUserDocId[0] = '\0';
+  settingsMonDocId[0] = '\0';
+  settingsTicksPerMeter = 0;
+  androidPaired = false;
+
+  PrintDebug("Settings deleted", PRINT_FLASH_DEBUG);
+}
+void deleteOperatorsData() {
+  PrintDebug("Deleting Operators data", PRINT_FLASH_DEBUG);
+
+  if (LittleFS.exists(OPERATORS_FILE)) {
+    LittleFS.remove(OPERATORS_FILE);
+  }
+  if (LittleFS.exists(OPERATOR_VER_FILE)) {
+    LittleFS.remove(OPERATOR_VER_FILE);
+  }
+  if (LittleFS.exists(OPERATORS_JSON_FILE)) {
+    LittleFS.remove(OPERATORS_JSON_FILE);
+  }
+
+  userCount = 0;
+  maxUsersReached = false;
+  memset(users, 0, sizeof(users));
+  pendingOperatorsUpdate = false;
+
+  PrintDebug("Operators data deleted", PRINT_FLASH_DEBUG);
+}
+void factoryReset() {
+  PrintDebug("FACTORY RESET starting", PRINT_GENERAL_DEBUG);
+
+  // Disconnect network services
+  if (mqttServer.connected()) {
+    mqttServer.disconnect();
+  }
+  WiFi.disconnect(true);
+  isWifiConnected = false;
+  isMqttServiceConnected = false;
+  isBluetoothConnected = false;
+
+  // Preferences (NVS)
+  deleteWifiCredFromFlash();
+  deleteSettingsFromFlash();
+
+  // Clear any leftover readings namespace if present
+  prefs.begin(FLASH_READINGS_KEY, false);
+  prefs.clear();
+  prefs.end();
+
+  // LittleFS files
+  deleteIotDataFile();
+  deleteSessionNrFile();
+  deleteOperatorsData();
+
+  // Runtime / pairing / session state
+  androidPaired = false;
+  androidConnected = false;
+  isSessionOpen = false;
+  isCalibrating = false;
+  hasNewCalibrateValue = false;
+  isPairing = false;
+  isRunningLive = false;
+  connectedDeviceId = "";
+  wheelTicksCount = 0;
+  wheelDistance = 0;
+  oldDistance = 0;
+  memset(&currentIotDataWheel, 0, sizeof(currentIotDataWheel));
+  memset(lastTagCode, 0, sizeof(lastTagCode));
+  tagPresented = false;
+
+  PrintDebug("FACTORY RESET complete — rebooting", PRINT_GENERAL_DEBUG);
+  digitalWrite(LED_MQTT_CONNECTED, LOW);
 }
 void readWifiCredFromFlash() {
   try {
@@ -2111,7 +2455,16 @@ void readWifiCredFromFlash() {
     String newSsid = prefs.getString(FLASH_WIFI_SSID, "");
     String newPassword = prefs.getString(FLASH_WIFI_PASSWORD, "");
     String ip = prefs.getString(FLASH_WIFI_IP, "");
+    String newMqttUser = prefs.getString(FLASH_MQTT_USER, "");
+    String newMqttPassword = prefs.getString(FLASH_MQTT_PASSWORD, "");  
+    prefs.end();
 
+    if (!newMqttUser.isEmpty()) {
+      mqttUser = newMqttUser;
+    }
+    if (!newMqttPassword.isEmpty()) {
+      mqttPassword = newMqttPassword;
+    }
     if (!newPassword.isEmpty()) {
       password = newPassword;
     }
@@ -2124,14 +2477,19 @@ void readWifiCredFromFlash() {
       ip.toCharArray(serverIP, sizeof(serverIP));
     }
 
+    if(ssid.isEmpty() || password.isEmpty() || ip.isEmpty() || mqttUser.isEmpty() || mqttPassword.isEmpty()) {
+      PrintDebug("WIFI Credentials are empty", PRINT_ERRORS);
+      return;
+    }
+
     gotWifiCredentials = true;
     PrintDebug(
       String("WIFI Cred (FLASH) -  ") + FLASH_WIFI_SSID + String(": ") + newSsid + ", " + FLASH_WIFI_PASSWORD +
                    String(": ") + newPassword + ", " + FLASH_WIFI_IP +
-                   String(": ") + ip,
-      PRINT_FLASH_DEBUG);
+                   String(": ") + ip + ", " + FLASH_MQTT_USER + String(": ") + newMqttUser,
+             PRINT_CREDENTIALS_DEBUG);
 
-    prefs.end();
+   
   } catch (const std::exception &e) {
     PrintDebug(String("readWifiCredFromFlash(): ") + e.what(), PRINT_ERRORS);
     return;
@@ -2179,6 +2537,7 @@ void loadOperatorsFromJsonArray(JsonArray operatorsArray) {
 
     String s_fullName;
     String s_access;
+    String s_docId;
     const char *tag = nullptr;
 
     if (v.is<JsonObject>()) {
@@ -2187,6 +2546,7 @@ void loadOperatorsFromJsonArray(JsonArray operatorsArray) {
       const char *firstName = opObj[JSON_OPERATOR_NAME];
       const char *surname = opObj[JSON_OPERATOR_SURNAME];
       const char *access = opObj[JSON_OPERATOR_ACCESS_LEVEL];
+      const char *docId = opObj[JSON_DOC_ID];
       tag = opObj[JSON_OPERATOR_TAG_ID];
 
       if (firstName) {
@@ -2209,34 +2569,51 @@ void loadOperatorsFromJsonArray(JsonArray operatorsArray) {
           s_access = s_access.substring(0, 29);
         }
       }
-    } else if (v.is<const char *>()) {
+
+      if (docId) {
+        s_docId = String(docId);
+      }
+    } 
+    else if (v.is<const char *>()) {
       tag = v.as<const char *>();
     }
 
     if (!tag)
       continue;
 
+      // Tag
     if (!parseTagString(tag, users[userCount].tag)) {
       PrintDebug(String("Invalid operator tag: ") + tag, PRINT_ERRORS);
       continue;
     }
 
+    // Full Name
     if (s_fullName.length() > 0) {
-      strncpy(users[userCount].name, s_fullName.c_str(),
-              sizeof(users[userCount].name) - 1);
+      strncpy(users[userCount].name, s_fullName.c_str(), sizeof(users[userCount].name) - 1);
       users[userCount].name[sizeof(users[userCount].name) - 1] = '\0';
-    } else {
+    } 
+    else {
       users[userCount].name[0] = '\0';
     }
 
+    // Access Level
     if (s_access.length() > 0) {
-      strncpy(users[userCount].accessLevel, s_access.c_str(),
-              sizeof(users[userCount].accessLevel) - 1);
-      users[userCount].accessLevel[sizeof(users[userCount].accessLevel) - 1] =
-          '\0';
-    } else {
+      strncpy(users[userCount].accessLevel, s_access.c_str(), sizeof(users[userCount].accessLevel) - 1);
+      users[userCount].accessLevel[sizeof(users[userCount].accessLevel) - 1] = '\0';
+    } 
+    else {
       users[userCount].accessLevel[0] = '\0';
     }
+
+    // DocID
+    if (s_docId.length() > 0) {
+      strncpy(users[userCount].docId, s_docId.c_str(), sizeof(users[userCount].docId) - 1);
+      users[userCount].docId[sizeof(users[userCount].docId) - 1] = '\0';
+    } 
+    else {
+      users[userCount].docId[0] = '\0';
+    }
+
     userCount++;
   }
 }
@@ -2491,14 +2868,7 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
   pinMode(SENSOR_WHEEL_1, INPUT);
   pinMode(SENSOR_WHEEL_2, INPUT);
-  pinMode(KEY_ROW1, OUTPUT);
-  pinMode(KEY_ROW2, OUTPUT);
-  pinMode(KEY_ROW3, OUTPUT);
-  pinMode(KEY_ROW4, OUTPUT);
-  pinMode(KEY_COL1, INPUT_PULLUP);
-  pinMode(KEY_COL2, INPUT_PULLUP);
-  pinMode(KEY_COL3, INPUT_PULLUP);
-  pinMode(KEY_COL4, INPUT_PULLUP);
+  keypadInit();
 
   // Until board is fixed
   pinMode(39, INPUT);
@@ -2508,6 +2878,9 @@ void setup() {
   digitalWrite(BUZZER, LOW);
   digitalWrite(TAG_LED, HIGH);
 
+  // REMOVE
+  //deleteWifiCredFromFlash();
+  
   myDeviceId = getDeviceName();
 
   // timer 0, prescaler 80 → 1 tick = 1 µs
@@ -2596,7 +2969,7 @@ void loop() {
     if(isSessionOpen) {
       lcdWrite(
         "Ready", 
-        "(Start)(Stop)", 
+        "(Start,End)", 
         true
       );
     } 
@@ -2680,6 +3053,14 @@ void loop() {
       break;
     }
 
+    // Factory Reset
+    if (startFactoryReset) {
+      startFactoryReset = false;
+      mainCasePtr = CASE_FACTORY_RESET;
+      subCasePtr = SUB_CASE_NONE;
+      break;
+    }
+
     // Calibration Mode
     if (calibrationMode) {
       calibrationMode = false;
@@ -2725,14 +3106,14 @@ void loop() {
       readIotDataFile();
       lcdWrite("Cloud Sync", "DONE");
       startTimout(DISPLAY_TIMEOUT);
-      buzzerOnNrOfBeeps = 2;
+      buzzerOn(2, 100, 100);
       mainCasePtr++;
     }
 
     // Pushing IOT Data...
     if (isPushingIotData) {
       isPushingIotData = false;
-      buzzerOnNrOfBeeps = 1;
+      buzzerOn(1, 100, 100);
       lcdWrite("Cloud Sync", "Busy ...");
       startTimout(DISPLAY_TIMEOUT);
       mainCasePtr++;
@@ -2743,6 +3124,7 @@ void loop() {
       isPushingIotDataTimeout = false;
       lcdWrite("TIMEOUT", "");
       startTimout(DISPLAY_TIMEOUT);
+      buzzerOn(1, 3000, 0);
       mainCasePtr++;
     }
 
@@ -2757,7 +3139,8 @@ void loop() {
     // Wifi Status
     if (WiFi.status() == WL_CONNECTED) {
       isWifiConnected = true;
-    } else {
+    } 
+    else {
       isWifiConnected = false;
       isMqttServiceConnected = false;
     }
@@ -2772,77 +3155,143 @@ void loop() {
   } break;
 
   // (Pairing) Start ----------------------------------------
-  
+  // Supports pairing with no WiFi/MQTT yet (credentials via Bluetooth first).
+  // Phases (subCasePtr):
+  //   0 = wait BT credentials
+  //   1 = wait WiFi
+  //   2 = wait MQTT / base ping
+  //   3 = wait #FOUND_MONITOR
   case 10: {
-    // Keep MQTT Alive
-    mqttServiceLoop();
-
-    if (!isWifiConnected) {
-      lcdWrite("Pairing ...", "No WiFi");
-      startTimout(DISPLAY_TIMEOUT);
-      mainCasePtr = 12;
-      break;
-    }
-
-    if (!mqttServer.connected()) {
-      lcdWrite("Pairing ...", "No MQTT");
-      startTimout(DISPLAY_TIMEOUT);
-      mainCasePtr = 12;
-      break;
-    }
-
     lcdWrite("Pairing...", "");
-
     isPairing = true;
     androidPaired = false;
+    btWifiOkNotified = false;
+    mqttBlockedByBase = false; // pairing may resume MQTT to this base
+    isMqttServiceConnected = false;
+    btnPairPressed = false;
+    stopKeyPressed = false;
+    backKeyPressed = false;
+    digitalWrite(LED_MQTT_CONNECTED, LOW);
     startTimout(PAIR_TIMEOUT);
+
+    // Ensure BLE is advertising so base can push credentials
+    bt_StartAdvertising();
+    bt_NotifyStatus(CMD_BT_PAIRING);
+
+    if (!ssid.isEmpty() && !password.isEmpty()) {
+      if (!isWifiConnected) {
+        wifiCasePtr = 3; // connect WiFi with stored creds
+        subCasePtr = 1;
+        lcdWrite("Pairing...", "WiFi...");
+      } else if (!mqttServer.connected() || !isMqttServiceConnected) {
+        subCasePtr = 2;
+        lcdWrite("Pairing...", "MQTT...");
+      } else {
+        subCasePtr = 3;
+        lcdWrite("Pairing...", "Wait Base...");
+      }
+    } else {
+      // No credentials yet — wait for base over Bluetooth
+      if (wifiCasePtr >= 3) {
+        wifiCasePtr = 1; // sit in BT / credential wait path
+      }
+      subCasePtr = 0;
+      lcdWrite("Pairing...", "BT Creds...");
+    }
+
     mainCasePtr++;
   } break;
 
-  // (isPairing) Wait:
-  // - Monitor Found
-  // - Cancel isPairing button
-  // - Timeout
+  // (Pairing) Wait for credentials / WiFi / MQTT / base discover
   case 11: {
-    // Monitor Found (From Android)
-    if (androidPaired) {
+    // Cancel
+    if (btnPairPressed || stopKeyPressed || backKeyPressed) {
+      btnPairPressed = false;
+      stopKeyPressed = false;
+      backKeyPressed = false;
       timerAlarmDisable(timer);
-      digitalWrite(LED_MQTT_CONNECTED, HIGH);
-
       isPairing = false;
+      androidPaired = false;
+      bt_NotifyStatus(CMD_BT_IDLE);
 
-      PrintDebug("Monitor Found", PRINT_GENERAL_DEBUG);
-      lcdWrite("Connected!", "");
+      PrintDebug("User Cancelled Pairing", PRINT_GENERAL_DEBUG);
+      lcdWrite("Cancelled", "");
       startTimout(DISPLAY_TIMEOUT);
       mainCasePtr++;
       break;
     }
 
-    // User Cancelled
-    if (btnPairPressed) {
-      timerAlarmDisable(timer);
-      digitalWrite(LED_MQTT_CONNECTED, HIGH);
-
-      btnPairPressed = false;
+    // Timeout
+    if (timeoutFlag) {
+      timeoutFlag = false;
       isPairing = false;
       androidPaired = false;
-
-      PrintDebug("User Cancelled Advertising", PRINT_GENERAL_DEBUG);
-      lcdWrite("Cancelled", "");
-      startTimout(3);
+      bt_NotifyStatus(CMD_BT_IDLE);
+      lcdWrite("Timeout", "");
+      startTimout(DISPLAY_TIMEOUT);
+      buzzerOn(1, 2000, 0);
       mainCasePtr++;
       break;
     }
 
-    if (timeoutFlag) {
-      timeoutFlag = false;
-      isPairing = false;
-      digitalWrite(LED_MQTT_CONNECTED, HIGH);
-
-      lcdWrite("Timeout", "");
-      startTimout(3);
-      mainCasePtr++;
+    // Phase 0: wait for WiFi credentials from base via Bluetooth
+    if (subCasePtr == 0) {
+      if (gotWifiCredentials && !ssid.isEmpty() && !password.isEmpty()) {
+        PrintDebug("Pairing: got BT credentials, connecting WiFi", PRINT_WIFI_DEBUG);
+        // Refresh pairing window for WiFi + MQTT + discover
+        startTimout(PAIR_TIMEOUT);
+        subCasePtr = 1;
+        lcdWrite("Pairing...", "WiFi...");
+      }
       break;
+    }
+
+    // Phase 1: wait for WiFi
+    if (subCasePtr == 1) {
+      mqttServiceLoop();
+      if (isWifiConnected || WiFi.status() == WL_CONNECTED) {
+        isWifiConnected = true;
+        subCasePtr = 2;
+        lcdWrite("Pairing...", "Connecting...");
+      }
+      break;
+    }
+
+    // Phase 2: wait for MQTT connected + base ping
+    if (subCasePtr == 2) {
+      mqttServiceLoop();
+
+      if (mqttServer.connected() && isMqttServiceConnected) {
+        // Fresh window for discover / FOUND_MONITOR
+        startTimout(PAIR_TIMEOUT);
+        buzzerOn(1, 500, 0);
+        subCasePtr = 3;
+        lcdWrite("Click SYNC", "on Android...");
+      }
+      break;
+    }
+
+    // Phase 3: wait for #FOUND_MONITOR (MQTT discover already answered while isPairing)
+    if (subCasePtr == 3) {
+      mqttServiceLoop();
+
+      if (androidPaired) {
+        timerAlarmDisable(timer);
+        isPairing = false;
+        bt_NotifyStatus(CMD_BT_IDLE);
+        // Paired again — restore green LED if MQTT is still up
+        if (mqttServer.connected()) {
+          isMqttServiceConnected = true;
+          digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        }
+
+        PrintDebug("Monitor Found", PRINT_GENERAL_DEBUG);
+        lcdWrite("Connected!", "");
+        buzzerOn(4, 100, 50);
+        startTimout(DISPLAY_TIMEOUT);
+        mainCasePtr++;
+        break;
+      }
     }
   } break;
 
@@ -2904,11 +3353,8 @@ void loop() {
           
           if(user.name[0]) {
             // Found User
-            strncpy(
-              currentIotDataWheel.supervisorName, 
-              user.name, 
-              sizeof(currentIotDataWheel.supervisorName) - 1
-            );
+            strncpy(currentIotDataWheel.supervisorName, user.name,sizeof(currentIotDataWheel.supervisorName) - 1);
+            strncpy(currentIotDataWheel.supervisorDocId, user.docId, sizeof(currentIotDataWheel.supervisorDocId) - 1);
             
             if(!compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
               subCasePtr = 4;
@@ -2927,6 +3373,7 @@ void loop() {
       // (Open Session) Invalid Tag
       case 4:{
         lcdWrite("Invalid Tag", "");
+        buzzerOn(1, 3000, 0);
         startTimout(3);
         subCasePtr++;    
       } break;
@@ -2987,6 +3434,7 @@ void loop() {
           if(user.name[0]) {
             // Found User
             strncpy(currentIotDataWheel.operatorName, user.name, sizeof(currentIotDataWheel.operatorName) - 1);
+            strncpy(currentIotDataWheel.operatorDocId, user.docId, sizeof(currentIotDataWheel.operatorDocId) - 1);
             subCasePtr = 4;
           } 
           else{
@@ -3036,7 +3484,7 @@ void loop() {
   case 22: {
     if (timeoutFlag) {
       timeoutFlag = false;
-      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back)(Stop)");
+      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back,Stop)");
       mainCasePtr++;
 
       //DEBUG
@@ -3050,7 +3498,7 @@ void loop() {
   case 23: {
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
-      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back)(Stop)");
+      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back,Stop)");
     }
 
     // Cancel
@@ -3073,7 +3521,7 @@ void loop() {
     switch (subCasePtr) {
       case 0:{
         //Cancel  
-        lcdWrite("Cancel?", "(Ent)(Back)");
+        lcdWrite("Cancel?", "(Ent,Back)");
         subCasePtr++;    
       } break;
       
@@ -3096,7 +3544,7 @@ void loop() {
       
       case 2:{
         // Stop
-        lcdWrite("Stop?", "(Ent)(Back)");
+        lcdWrite("Stop?", "(Ent,Back)");
         subCasePtr++;    
       } break;
       
@@ -3256,10 +3704,8 @@ case 31:{
     if(user.name[0]) {
       // Found User
       strncpy(
-        currentIotDataWheel.supervisorName, 
-        user.name, 
-        sizeof(currentIotDataWheel.supervisorName) - 1
-      );
+        currentIotDataWheel.supervisorName, user.name,sizeof(currentIotDataWheel.supervisorName) - 1);
+        strncpy(currentIotDataWheel.supervisorDocId, user.docId, sizeof(currentIotDataWheel.supervisorDocId) - 1);
       
       if(!compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
         mainCasePtr = 32;
@@ -3312,7 +3758,7 @@ case 35:{
   case 40:{
     lcdWrite(
       "End Session?", 
-      "(Ent)(Back)", 
+      "(Ent,Back)", 
       true
     );
     mainCasePtr++;
@@ -3328,12 +3774,6 @@ case 35:{
     
     if(enterKeyPressed) {
       enterKeyPressed = false;
-      lcdWrite(
-        "Supervisor Tag", 
-        "(Back)", 
-        true
-      );
-      startTimout(2);
       mainCasePtr++;
     }
   } break;
@@ -3352,11 +3792,9 @@ case 35:{
       User user = getUserNameByTag(tagCode);
       if(user.accessLevel[0]) {
         if(compareString(user.accessLevel, ACCESS_LEVEL_SUPERVISOR)) {
-          strncpy(
-            currentIotDataWheel.supervisorName, 
-            user.name, 
-            sizeof(currentIotDataWheel.supervisorName) - 1
-          );
+          strncpy(currentIotDataWheel.supervisorName, user.name, sizeof(currentIotDataWheel.supervisorName) - 1 );
+          strncpy(currentIotDataWheel.supervisorDocId, user.docId, sizeof(currentIotDataWheel.supervisorDocId) - 1 );
+
           isSessionOpen = false;
           mainCasePtr = 46;
         }
@@ -3364,12 +3802,12 @@ case 35:{
           mainCasePtr++; // Invalid Tag
         }
       }
-      
-      if(backKeyPressed){       
-        subCasePtr = SUB_CASE_NONE;
-        mainCasePtr = CASE_HOME;
-      };
     }
+    
+    if(backKeyPressed){       
+      subCasePtr = 0;
+      mainCasePtr = CASE_START_WHEEL;
+    };
   } break;
 
    // (End Session) Invalid Tag
@@ -3406,7 +3844,7 @@ case 35:{
   // Calibrate ----------------------------------------
 
   case 50: {
-    lcdWrite("Calibrate", "(Start)(Back)");
+    lcdWrite("Calibrate", "(Start,Back)");
     hasNewCalibrateValue = false;
     mainCasePtr++;
   } break;
@@ -3429,7 +3867,7 @@ case 35:{
   } break;
 
   case 52: {
-    lcdWrite("Ticks: " + String(wheelTicksCount), "(Back)(Stop)", false);
+    lcdWrite("Ticks: " + String(wheelTicksCount), "(Back,Stop)", false);
     mainCasePtr++;
   } break;
 
@@ -3449,7 +3887,7 @@ case 35:{
     // Wheel Moved
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
-      lcdWrite("Ticks: " + String(wheelTicksCount), "(Back)(Stop)", false);
+      lcdWrite("Ticks: " + String(wheelTicksCount), "(Back,Stop)", false);
     }
   } break;
 
@@ -3540,6 +3978,34 @@ case 35:{
     // Android Disconnected
     if (!androidConnected) {
       mainCasePtr = CASE_HOME;
+    }
+  } break;
+
+  // Factory Reset -----------------------------------
+  // Trigger: BACK x 5 on home (within 5 seconds)
+  case 80: {
+    lcdWrite("Factory Reset?", "(Ent,Back)");
+    enterKeyPressed = false;
+    backKeyPressed = false;
+    mainCasePtr++;
+  } break;
+
+  case 81: {
+    if (backKeyPressed) {
+      backKeyPressed = false;
+      lcdWrite("Cancelled", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+      break;
+    }
+
+    if (enterKeyPressed) {
+      enterKeyPressed = false;
+      lcdWrite("Factory Reset", "Erasing...");
+      buzzerOn(3, 100, 100);
+      factoryReset();
+      delay(1500);
+      ESP.restart();
     }
   } break;
 
