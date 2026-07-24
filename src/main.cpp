@@ -50,6 +50,7 @@ const int port = 8080;
 #define CASE_TAG_PRESENTED 60
 #define CASE_LIVE_WHEEL_DATA 70
 #define CASE_FACTORY_RESET 80
+#define CASE_BATTERY_LOW 200
 #define CASE_DISPLAY_RETURN_HOME 4
 #define CASE_HOME 2
 
@@ -101,6 +102,10 @@ const String CMD_BT_IDLE = "IDLE";
 const String CMD_BT_WIFI_OK = "WIFI_OK";
 const String CMD_BT_SHOESH = "SHOESH"; // Base reject: stop MQTT to this broker
 bool mqttBlockedByBase = false;        // set by SHOESH; cleared on pair / new creds
+// MQTT is WiFi-task only — other tasks set these flags
+volatile bool pendingMqttDisconnect = false;
+volatile bool pendingMqttReportTag = false;
+volatile bool pendingMqttReportLive = false;
 
 // Button Debounce
 volatile bool debPairFallEdge = false;
@@ -329,6 +334,9 @@ int factoryResetPressCount = 0;
 #define PAIR_MODE_PRESS_COUNT 5
 #define CALIBRATE_MODE_PRESS_COUNT 5
 #define FACTORY_RESET_PRESS_COUNT 5
+#define FACTORY_RESET_PIN "1852"
+char factoryResetPin[5] = "";
+uint8_t factoryResetPinIndex = 0;
 
 // Task handle
 TaskHandle_t GeneralTaskHandle = NULL;
@@ -372,6 +380,7 @@ bool startFactoryReset = false;
 bool btConnected = false;
 // bool isWifiConnected = false;
 bool isPairing = false;
+bool clearWifiCredsOnPairFail = false; // wipe WiFi only on first-pair cancel/timeout
 bool btWifiOkNotified = false;
 bool androidConnected = false;
 bool calibrationMode = false;
@@ -387,9 +396,18 @@ int buzzerOnTime = 0;
 int buzzerOffTime = 0;
 bool showMqttWarning = true;
 volatile bool pendingOperatorsUpdate = false;
+bool newOperatorsRecieved = false;
+bool wakeBacklight = false;
 
 // Battery
 int batteryLevel = 0; // Percentage
+bool batteryLow = false;
+bool batteryPowerSaveActive = false;
+volatile bool pendingBatteryLcdSleep = false; // loop(): re-init LCD, backlight off
+volatile bool pendingBatteryLcdWake = false;  // loop(): re-init LCD, home screen
+#define BAT_MAX_COUNT 4200
+#define BAT_MIN_COUNT 3300
+#define BAT_LOW 3300
 
 // Debug
 const bool PRINT_ERRORS = true;
@@ -400,6 +418,9 @@ const bool PRINT_WIFI_DEBUG = true;
 const bool PRINT_BT_DEBUG = true;
 const bool PRINT_DEBOUNCE_DEBUG = true;
 bool simulateWheelDistance = false;
+bool skipResetPin = true;
+bool showBatAdcCount = true; // line2 suffix: "1234 85%" (ADC + percent)
+
 
 // LittleFS Filenames
 const String OPERATOR_VER_FILE = "/operators_version.bin";
@@ -420,6 +441,9 @@ void bt_StopServer();
 void bt_StartServer();
 void bt_StartAdvertising();
 void bt_NotifyStatus(const String &status);
+void applyBatteryPowerSave();
+void clearBatteryPowerSave();
+void lcdReinit();
 void mqttTX(const JsonDocument &msg, const String &topic);
 void mqttRx(char *topic, byte *payload, unsigned int length);
 void PrintDebug(String, bool);
@@ -429,8 +453,7 @@ void lcdRefresh();
 bool getKeypad(char *out, size_t outSize);
 void keypadInit();
 void saveDistancesToNVM(int value);
-void saveWifiCredToFlash(String ssid, String password, String ip, String mqttUser,
-                         String mqttPassword);
+void saveWifiCredToFlash(String ssid, String password, String ip, String mqttUser, String mqttPassword);
 void deleteWifiCredFromFlash();
 void deleteSettingsFromFlash();
 void deleteOperatorsData();
@@ -442,14 +465,17 @@ String readOperatorVerFile();
 void saveOperatorVerToFile(const char *ver);
 void loadOperatorsFromJsonArray(JsonArray operatorsArray);
 void saveOperatorsToFile();
+void saveOperators(const char *operators);
 void queueOperatorsUpdate(JsonArray operatorsArray);
 void processPendingOperatorsUpdate();
-void saveOperatorsToFile(const char *operators);
+void saveOperators(const char *operators);
 void readOperatorsFromFile();
 void removeDistancesFromNVM();
 void loadDistancesFromNVM(std::vector<int> &nums);
 bool readReadingsFromFlash(const char *key, IotData_Wheel &out);
 void mqttReportMyID();
+void mqttReportTag();
+void mqttReportLiveIotData();
 void mqttPushIotData(int);
 void uuid4_hex(char out[33]);
 void getAllReadings(std::vector<IotData_Wheel> &data);
@@ -457,6 +483,7 @@ bool wifiCredentialsExist();
 String tagToString(byte *addr);
 void mqttSendSync();
 void mqttServiceLoop();
+void mqttProcessDeferred(); // WiFi task only — disconnect / queued publishes
 String GetMacAddress();
 String readSessionNrFromFile() ;
 void writeSessionNrToFile(const char *session);
@@ -524,7 +551,8 @@ void IRAM_ATTR onTimerOneSec() {
     }else{
       timerAlarmDisable(timer);
     }
-  } else {
+  } 
+  else {
     runningTime--;
   }
 }
@@ -563,7 +591,7 @@ void GeneralTask(void *parameter) {
   bool showStack = true;
 
   for (;;) {
-    // Blink LED
+    // LED sequence during startup
     if (startup) {
       if (delay++ >= 300) {
         delay = 0;
@@ -608,9 +636,21 @@ void GeneralTask(void *parameter) {
           startup = false;
         }
       }
-    } else {
-
-      // Blue - Bluetooth
+    } 
+    // Battery Low
+    else if (batteryLow || batteryPowerSaveActive) {
+      static bool ledBatState = false;
+      if (delay++ >= 250) {
+        delay = 0;
+        ledBatState = !ledBatState;
+      }
+      digitalWrite(LED_BLUETOOTH, LOW);
+      digitalWrite(LED_WIFI_CONNECTED, ledBatState ? HIGH : LOW);
+      digitalWrite(LED_MQTT_CONNECTED, LOW);
+    } 
+    // Normal Running
+    else {
+      // Blue - Bluetooth  
       if (isBluetoothConnected)
         digitalWrite(LED_BLUETOOTH, HIGH); // Blue
       else
@@ -630,7 +670,7 @@ void GeneralTask(void *parameter) {
           delay = 0;
           ledMqttState = true;
         }
-        if (delay++ >= 700) {
+        if (delay++ >= 200) {
           delay = 0;
           ledMqttState = !ledMqttState;
         }
@@ -655,6 +695,10 @@ void GeneralTask(void *parameter) {
 
       PrintDebug(String("Key Pressed: ") + key, PRINT_GENERAL_DEBUG);
 
+      // Wake Backlight (Battery Low)
+      if(batteryLow){
+        wakeBacklight = true;
+      }
       // Control
       if (strcmp(key, KEY_ENTER) == 0)
         enterKeyPressed = true;
@@ -760,22 +804,27 @@ void GeneralTask(void *parameter) {
     }
 
     // Tag LED Blink
-    if (tagLedDelay == 0) {
-      if (ledTagState) {
-        // Off time
-        tagLedDelay = 2000;
-        ledTagState = LOW;
-        digitalWrite(TAG_LED, LOW);
+    if (!batteryLow && !batteryPowerSaveActive) {
+      if (tagLedDelay == 0) {
+        if (ledTagState) {
+          // Off time
+          tagLedDelay = 2000;
+          ledTagState = LOW;
+          digitalWrite(TAG_LED, LOW);
+        } else {
+          // On time
+          tagLedDelay = 50;
+          ledTagState = HIGH;
+          digitalWrite(TAG_LED, HIGH);
+        }
       } else {
-        // On time
-        tagLedDelay = 50;
-        ledTagState = HIGH;
-        digitalWrite(TAG_LED, HIGH);
+        tagLedDelay--;
       }
-    } else {
-      tagLedDelay--;
+    } else if (ledTagState) {
+      ledTagState = LOW;
+      digitalWrite(TAG_LED, LOW);
     }
-
+   
     // Read Battery Voltage
     if (batReadDelay++ >= 30000 || getFirstBatReading) {
       // Every 30 seconds or first reading
@@ -783,15 +832,27 @@ void GeneralTask(void *parameter) {
       batReadDelay = 0;
       
       int adcValue = analogRead(ADC_BATTERY);
-      batteryLevel = map(adcValue, 0, 3800, 0, 100); // Assuming a 12-bit ADC (3800 Max count)
+      batteryLevel = map(adcValue, BAT_MIN_COUNT, BAT_MAX_COUNT, 0, 100); // Assuming a 12-bit ADC (3800 Max count)
+      
       if (batteryLevel > 100){
         batteryLevel = 100; // Cap at 100%
+      }
+      if (batteryLevel <= 0){
+        batteryLevel = 0; // Cap at 100%
       } 
-      newBatReadingAvailable = true;
+      if(adcValue < BAT_LOW){
+        batteryLow = true;
+      }else{
+        batteryLow = false;
+      }
 
-      // PrintDebug("Battery Level: " + String(adcValue) + " (" +
-      //            String(batteryLevel) + "%)",
-      //            PRINT_GENERAL_DEBUG);
+      if (batteryLow && !batteryPowerSaveActive) {
+        applyBatteryPowerSave();
+      } else if (!batteryLow && batteryPowerSaveActive) {
+        clearBatteryPowerSave();
+      }
+
+      newBatReadingAvailable = true;
     }
 
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -806,6 +867,13 @@ void wifiConnectTask(void *parameter) {
     if (!printed) {
       PrintDebug("WIFI Task Running", PRINT_WIFI_DEBUG);
       printed = true;
+    }
+
+    // All MQTT client I/O stays on this task
+    mqttProcessDeferred();
+
+    if (batteryLow && wifiCasePtr != 16) {
+      wifiCasePtr = 16;
     }
 
     switch (wifiCasePtr) {
@@ -902,6 +970,13 @@ void wifiConnectTask(void *parameter) {
 
       mqttServer.setBufferSize(MQTT_RX_BUFFER_SIZE);
 
+      // Re-pair / forced handshake: drop stale broker session so DEVICE_ID +
+      // subscribe + PING actually run (connect() is a no-op if already up).
+      if (mqttServer.connected()) {
+        mqttServer.disconnect();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+      }
+
       if (mqttConnect()) {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
 
@@ -948,7 +1023,7 @@ void wifiConnectTask(void *parameter) {
       }
       mqttSendPing();
       // Dedicated ping deadline — do NOT use startTimout() (shared with pairing UI)
-      pingDeadlineMs = millis() + (isPairing ? 8000UL : 2000UL);
+      pingDeadlineMs = millis() + (isPairing ? 5000UL : 2000UL);
       wifiCasePtr++;
     } break;
 
@@ -1041,6 +1116,29 @@ void wifiConnectTask(void *parameter) {
         wifiCasePtr = 5;
       }
       vTaskDelay(100 / portTICK_PERIOD_MS);
+    } break;
+
+    // Battery low — radios off until charge recovers
+    case 16: {
+      if (mqttServer.connected()) {
+        mqttServer.disconnect();
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+      }
+      isWifiConnected = false;
+      isMqttServiceConnected = false;
+
+      if (pServer != nullptr) {
+        bt_StopServer();
+      }
+
+      if (!batteryLow) {
+        WiFi.mode(WIFI_STA);
+        wifiCasePtr = 0;
+      }
+      vTaskDelay(500 / portTICK_PERIOD_MS);
     } break;
 
     // -- Push Measurements ----------------------------------------------
@@ -1509,13 +1607,20 @@ void lcdWrite(const char* line1, const char* line2, bool showMeasureCnt) {
   }
   
   // ---- LINE 2 ----
-  textWidth = 16 - strlen(percent);
-
-  snprintf(
-    buffer2, 
-    sizeof(buffer2),
-    "%-*.*s%s", textWidth, textWidth, line2, percent
-  );
+  char right[12];
+  if (showBatAdcCount) {
+    // 4-digit ADC + percent, e.g. "1234 85%"
+    int adcValue = analogRead(ADC_BATTERY);
+    snprintf(right, sizeof(right), "%4d%s", adcValue, percent);
+  } else {
+    snprintf(right, sizeof(right), "%s", percent);
+  }
+  textWidth = 16 - (int)strlen(right);
+  if (textWidth < 0) {
+    textWidth = 0;
+  }
+  snprintf(buffer2, sizeof(buffer2), "%-*.*s%s", textWidth, textWidth, line2,
+           right);
 
   // ---- LCD UPDATE ----
   lcd_i2c.setCursor(0, 0);
@@ -1534,24 +1639,8 @@ void lcdWrite(const char* line1, const char* line2) {
   lcdShowMeasureCnt = false;
   lcdHasContent = true;
   
-  // Format percent safely
-  snprintf(percent, sizeof(percent), " %d%%", batteryLevel);
-
-  // ---- LINE 1 ----
-  snprintf(
-    buffer1, 
-    sizeof(buffer1), 
-    "%-16.16s", line1
-  );
-    
-  // ---- LINE 2 ----
-  int textWidth = 16 - strlen(percent);
-
-  snprintf(
-    buffer2, 
-    sizeof(buffer2),
-    "%-*.*s%s", textWidth, textWidth, line2, percent
-  );
+  snprintf(buffer1, sizeof(buffer1), "%-16.16s", line1);
+  snprintf(buffer2, sizeof(buffer2), "%-16.16s", line2);
 
   // ---- LCD UPDATE ----
   lcd_i2c.setCursor(0, 0);
@@ -1596,9 +1685,61 @@ bool compareString(const char *a, const char *b) {
   return *a == '\0' && *b == '\0';
 }
 void buzzerOn(int nrOfBeeps, int onTime, int offTime) {
+  if (batteryLow || batteryPowerSaveActive) {
+    return; // conserve power
+  }
   buzzerOnNrOfBeeps = nrOfBeeps;
   buzzerOnTime = onTime;
   buzzerOffTime = offTime;
+}
+// Re-init after CPU freq change. Do NOT call Wire.end() on ESP32 — it leaves
+// a NULL TX buffer and all later LCD I2C writes fail (backlight stuck off).
+void lcdReinit() {
+  delay(20);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+  lcd_i2c.init();
+  delay(50);
+  lcd_i2c.clear();
+}
+void applyBatteryPowerSave() {
+  if (batteryPowerSaveActive) {
+    return;
+  }
+  batteryPowerSaveActive = true;
+  PrintDebug("Battery LOW — power save ON", PRINT_GENERAL_DEBUG);
+
+  buzzerOnNrOfBeeps = 0;
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(LED_BLUETOOTH, LOW);
+  digitalWrite(LED_WIFI_CONNECTED, LOW);
+  digitalWrite(LED_MQTT_CONNECTED, LOW);
+  digitalWrite(TAG_LED, LOW);
+
+  setCpuFrequencyMhz(80);
+  // LCD/I2C only from loop() — avoid Wire from FreeRTOS tasks
+  pendingBatteryLcdSleep = true;
+
+  // WiFi task parks radios (MQTT/WiFi/BLE)
+  pendingMqttDisconnect = true;
+  isMqttServiceConnected = false;
+  isWifiConnected = false;
+  wifiCasePtr = 16;
+}
+void clearBatteryPowerSave() {
+  if (!batteryPowerSaveActive) {
+    return;
+  }
+  batteryPowerSaveActive = false;
+  PrintDebug("Battery OK — power save OFF", PRINT_GENERAL_DEBUG);
+
+  setCpuFrequencyMhz(240);
+  // LCD/I2C only from loop()
+  pendingBatteryLcdWake = true;
+
+  // Resume network stack
+  wifiCasePtr = 0;
 }
 void keypadInit() {
   // Let strapping pins (GPIO 0, 2, 5) settle after boot — required on DevKitC.
@@ -1675,6 +1816,51 @@ bool getKeypad(char *out, size_t outSize) {
   }
   return false;
 }
+void uuid4_hex(char out[33]) {
+  uint8_t bytes[16];
+  esp_fill_random(bytes, sizeof(bytes));
+  bytes[6] = (bytes[6] & 0x0F) | 0x40;
+  bytes[8] = (bytes[8] & 0x3F) | 0x80;
+
+  for (int i = 0; i < 16; i++) {
+    snprintf(out + i * 2, 3, "%02x", bytes[i]);
+  }
+}
+
+// MQTT
+void mqttTX(const JsonDocument &msg, const String &topic) {
+  if (!isWifiConnected) {
+    Serial.println("WiFi not connected");
+    return;
+  }
+
+  if (!mqttServer.connected()) {
+    Serial.println("MQTT not connected");
+    return;
+  }
+
+  size_t payloadSize = measureJson(msg);
+  char payload[MQTT_PAYLOAD_MAX];
+
+  if (payloadSize >= sizeof(payload)) {
+    Serial.printf("MQTT payload too large %i>%i", payloadSize, sizeof(payload));
+    return;
+  }
+
+  size_t len = serializeJson(msg, payload);
+  payload[len] = '\0'; // Null-terminate the string in case buffer overflows
+  bool ok = mqttServer.publish(topic.c_str(), payload, len);
+
+  Serial.print("MQTT TX: ");
+  Serial.println(payload); // Safe, prints the JSON string
+  Serial.printf("MQTT payload: %i/%i \n", payloadSize, sizeof(payload));
+
+  if (ok) {
+    Serial.println("OK");
+  } else {
+    Serial.println("MQTT publish failed");
+  }
+}
 void mqttSendPing() {
   gotPing = false;
   MqttJsonDoc mqttPacket;
@@ -1722,6 +1908,27 @@ void mqttServiceLoop() {
   mqttServer.loop();
   if (pendingOperatorsUpdate) {
     processPendingOperatorsUpdate();
+  }
+}
+void mqttProcessDeferred() {
+  // Must only run on wifiConnectTask — never from GeneralTask / BLE / ISR
+  
+  if (pendingMqttDisconnect) {
+    pendingMqttDisconnect = false;
+    if (mqttServer.connected()) {
+      mqttServer.disconnect();
+    }
+  }
+  if (mqttBlockedByBase || !mqttServer.connected()) {
+    return;
+  }
+  if (pendingMqttReportTag) {
+    pendingMqttReportTag = false;
+    mqttReportTag();
+  }
+  if (pendingMqttReportLive) {
+    pendingMqttReportLive = false;
+    mqttReportLiveIotData();
   }
 }
 void mqttRx(char *topic, byte *payload, unsigned int length) {
@@ -1806,7 +2013,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
   
   if (_topic == MQTT_TOPIC_TO_IOT + '/' + myDeviceId) {
     
-    // Calibration Mode
+    // CALIBRATE
     if (_cmd == MQTT_CMD_CALIBRATE) {
       connectedDeviceId = fromDeviceId;
       wheelTicksCount = 0;
@@ -1828,7 +2035,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
     }
 
-    // Live Connection Requested
+    // CONNECT MONITOR
     if (_cmd == MQTT_CMD_CONNECT_MONITOR) {
       androidConnected = true;
       connectedDeviceId = fromDeviceId;
@@ -1846,7 +2053,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
     }
 
-    // DisConnection Requested
+    // DISCONNECT MONITOR
     if (_cmd == MQTT_CMD_DISCONNECT_MONITOR) {
       androidConnected = false;
       connectedDeviceId = fromDeviceId;
@@ -1863,9 +2070,9 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
     }
 
-    // Pair DONE (ACK) (Save Settings to FLASH)
+    // FOUND MONITOR (Pair Done) (Save Settings to FLASH)
     if (_cmd == MQTT_CMD_FOUND_MONITOR) {
-      androidPaired = true;
+      
 
       // iotType
       const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
@@ -1909,6 +2116,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
       newSettingsRecieved = true;
+      androidPaired = true;
     }
 
     // Readings Data (ACK)
@@ -1921,14 +2129,14 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       gotPing = true;
     }
 
-    // Settings (ADD LIST OF BASE STATIONS ALLOWED)
+    // SETTINGS
     if (_cmd == MQTT_CMD_SETTINGS) {
       // TODO: Add List of Base Stations allowed.
       // SAVE to flash
       // SEND ACK
     }
 
-    // Operators
+    // OPERATORS UPDATE
     if (_cmd == MQTT_CMD_OPERATORS) {
 
       const char *ver = _payloadJson[JSON_OPERATORS_VERSION].as<const char *>();
@@ -1950,39 +2158,6 @@ bool mqttConnect() {
                               mqttPassword.c_str());
   }
   return mqttServer.connect(myDeviceId.c_str());
-}
-void mqttTX(const JsonDocument &msg, const String &topic) {
-  if (!isWifiConnected) {
-    Serial.println("WiFi not connected");
-    return;
-  }
-
-  if (!mqttServer.connected()) {
-    Serial.println("MQTT not connected");
-    return;
-  }
-
-  size_t payloadSize = measureJson(msg);
-  char payload[MQTT_PAYLOAD_MAX];
-
-  if (payloadSize >= sizeof(payload)) {
-    Serial.printf("MQTT payload too large %i>%i", payloadSize, sizeof(payload));
-    return;
-  }
-
-  size_t len = serializeJson(msg, payload);
-  payload[len] = '\0'; // Null-terminate the string in case buffer overflows
-  bool ok = mqttServer.publish(topic.c_str(), payload, len);
-
-  Serial.print("MQTT TX: ");
-  Serial.println(payload); // Safe, prints the JSON string
-  Serial.printf("MQTT payload: %i/%i \n", payloadSize, sizeof(payload));
-
-  if (ok) {
-    Serial.println("OK");
-  } else {
-    Serial.println("MQTT publish failed");
-  }
 }
 void mqttReportLiveIotData() {
   MqttJsonDoc mqttPacket;
@@ -2023,16 +2198,6 @@ void mqttReportMyID() {
   mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_DEVICE_ID;
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-}
-void uuid4_hex(char out[33]) {
-  uint8_t bytes[16];
-  esp_fill_random(bytes, sizeof(bytes));
-  bytes[6] = (bytes[6] & 0x0F) | 0x40;
-  bytes[8] = (bytes[8] & 0x3F) | 0x80;
-
-  for (int i = 0; i < 16; i++) {
-    snprintf(out + i * 2, 3, "%02x", bytes[i]);
-  }
 }
 void mqttPushIotData(int index) {
   MqttJsonDoc mqttPacket;
@@ -2124,9 +2289,7 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
       pingDeadlineMs = 0;
       isMqttServiceConnected = false;
       digitalWrite(LED_MQTT_CONNECTED, LOW);
-      if (mqttServer.connected()) {
-        mqttServer.disconnect();
-      }
+      pendingMqttDisconnect = true; // wifi task disconnects PubSubClient
       wifiCasePtr = 15;
       PrintDebug("BT SHOESH: MQTT stopped to this base", PRINT_BT_DEBUG);
       return;
@@ -2405,14 +2568,12 @@ void deleteOperatorsData() {
 void factoryReset() {
   PrintDebug("FACTORY RESET starting", PRINT_GENERAL_DEBUG);
 
-  // Disconnect network services
-  if (mqttServer.connected()) {
-    mqttServer.disconnect();
-  }
-  WiFi.disconnect(true);
+  // Disconnect network — MQTT client only from wifi task; drop WiFi here
+  pendingMqttDisconnect = true;
   isWifiConnected = false;
   isMqttServiceConnected = false;
   isBluetoothConnected = false;
+  WiFi.disconnect(true);
 
   // Preferences (NVS)
   deleteWifiCredFromFlash();
@@ -2617,16 +2778,6 @@ void loadOperatorsFromJsonArray(JsonArray operatorsArray) {
     userCount++;
   }
 }
-void saveOperatorsToFile() {
-  File f = LittleFS.open(OPERATORS_FILE, "w");
-  for (uint16_t i = 0; i < userCount; i++) {
-    f.write((uint8_t *)&users[i], sizeof(User));
-  }
-  f.close();
-
-  PrintDebug(String("Saved Operators to file: ") + String(userCount) + " users",
-             PRINT_GENERAL_DEBUG);
-}
 void queueOperatorsUpdate(JsonArray operatorsArray) {
   File f = LittleFS.open(OPERATORS_JSON_FILE, "w");
   if (!f) {
@@ -2685,7 +2836,18 @@ void processPendingOperatorsUpdate() {
   loadOperatorsFromJsonArray(operatorsArray);
   saveOperatorsToFile();
 }
-void saveOperatorsToFile(const char *operators) {
+void saveOperatorsToFile() {
+  File f = LittleFS.open(OPERATORS_FILE, "w");
+  for (uint16_t i = 0; i < userCount; i++) {
+    f.write((uint8_t *)&users[i], sizeof(User));
+  }
+  f.close();
+
+  PrintDebug(String("Saved Operators to file: ") + String(userCount) + " users",
+             PRINT_GENERAL_DEBUG);
+  newOperatorsRecieved = true;
+}
+void saveOperators(const char *operators) {
 
   if (operators && strlen(operators) > 0) {
     DynamicJsonDocument doc(strlen(operators) + 256);
@@ -2856,6 +3018,8 @@ void resetIotData() {
 }
 
 void setup() {
+  setCpuFrequencyMhz(240);
+  
   Serial.begin(9600);
   Wire.begin(SDA_PIN, SCL_PIN);
 
@@ -2916,7 +3080,8 @@ void setup() {
     &ConnectWiFiTaskHandle, // Task handle
     1                       // Core 1
   );
-
+  vTaskSuspend(ConnectWiFiTaskHandle);
+  
   xTaskCreatePinnedToCore(IotTask, 
     "IotTask",      // Task name
     7000,           // Stack size (bytes)
@@ -2945,24 +3110,59 @@ void setup() {
 void loop() {
   vTaskDelay(1 / portTICK_PERIOD_MS);
 
+  // Battery power-save LCD work must run here (same context as other lcdWrite)
+  if (pendingBatteryLcdSleep) {
+    pendingBatteryLcdSleep = false;
+    lcdReinit();
+    lcd_i2c.noBacklight();
+  }
+  if (pendingBatteryLcdWake) {
+    pendingBatteryLcdWake = false;
+    lcdReinit();
+    lcd_i2c.backlight();
+    mainCasePtr = CASE_HOME; // redraw Ready / No Session
+  }
+
   switch (mainCasePtr) {
 
   // Splash
   case 0: {
-    lcdWrite("Wheel " + VERSION, "Connecting...");
-    startTimout(5);
-    readOperatorsFromFile();
-    readIotDataFile();
-    readSettingsFromFlash();
-    mainCasePtr++;
-  }  break;
+    switch (subCasePtr) {
+      case 0: {
+        // One-time boot init
+        readOperatorsFromFile();
+        readIotDataFile();
+        readSettingsFromFlash();
+        vTaskResume(ConnectWiFiTaskHandle);
 
-  // Splash Screen timout
-  case 1: 
-  if (timeoutFlag) { 
-    timeoutFlag = false;
-      mainCasePtr++;
-   } break;
+        // Device ID on line 1 (full 16 cols; line2 would be truncated by bat %)
+        lcdWrite(myDeviceId, "");
+        startTimout(5);
+        subCasePtr = 1;
+      } break;
+
+      case 1: {
+        if (timeoutFlag) {
+          timeoutFlag = false;
+          lcdWrite("Wheel " + VERSION, "Connecting...");
+          startTimout(DISPLAY_TIMEOUT);
+          subCasePtr = SUB_CASE_NONE;
+          mainCasePtr++;
+        }
+      } break;
+
+      default:
+        subCasePtr = 0;
+        break;
+    }
+  } break;
+
+  case 1: {
+    if (timeoutFlag) {
+      timeoutFlag = false;
+      mainCasePtr++; 
+    }
+  } break;
 
   // Ready
   case 2: {
@@ -3000,10 +3200,20 @@ void loop() {
   // - Wait for Connection request 
   case 3: {
    
-    // Keep MQTT Alive
-    mqttServiceLoop();
+    // Battery Low
+    if(batteryLow){
+      applyBatteryPowerSave();
+      // Brief warning — loop() may still be applying lcd sleep; force wake text
+      pendingBatteryLcdSleep = false;
+      lcdReinit();
+      lcd_i2c.backlight();
+      lcdWrite("Battery Low", String(batteryLevel) + "%");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr = CASE_BATTERY_LOW;
+      break;
+    }
 
-     // start Key Pressed
+    // start Key Pressed
      if (startKeyPressed) {
       startKeyPressed = false;
       
@@ -3092,6 +3302,16 @@ void loop() {
       mainCasePtr = CASE_DISPLAY_RETURN_HOME;
     }
 
+    // New Operators Recieved
+    if (newOperatorsRecieved) {
+      newOperatorsRecieved = false;
+      buzzerOn(1,500,0);
+      
+      lcdWrite("New Operators", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+    }
+
     // tag Presented
     if (tagPresented && !isSessionOpen) {
       tagPresented = false;
@@ -3168,6 +3388,8 @@ void loop() {
     btWifiOkNotified = false;
     mqttBlockedByBase = false; // pairing may resume MQTT to this base
     isMqttServiceConnected = false;
+    // Only wipe WiFi on fail if this was a first pair (no stored creds yet)
+    clearWifiCredsOnPairFail = ssid.isEmpty() || password.isEmpty();
     btnPairPressed = false;
     stopKeyPressed = false;
     backKeyPressed = false;
@@ -3183,14 +3405,16 @@ void loop() {
         wifiCasePtr = 3; // connect WiFi with stored creds
         subCasePtr = 1;
         lcdWrite("Pairing...", "WiFi...");
-      } else if (!mqttServer.connected() || !isMqttServiceConnected) {
+      } else {
+        // Re-pair / already on WiFi: wifi task is often idle (case 9) after a
+        // prior ping. Clear + force MQTT reconnect/ping or UI waits forever.
+        gotPing = false;
+        wifiCasePtr = 5;
         subCasePtr = 2;
         lcdWrite("Pairing...", "MQTT...");
-      } else {
-        subCasePtr = 3;
-        lcdWrite("Pairing...", "Wait Base...");
       }
-    } else {
+    } 
+    else {
       // No credentials yet — wait for base over Bluetooth
       if (wifiCasePtr >= 3) {
         wifiCasePtr = 1; // sit in BT / credential wait path
@@ -3213,7 +3437,10 @@ void loop() {
       isPairing = false;
       androidPaired = false;
       bt_NotifyStatus(CMD_BT_IDLE);
-
+      if (clearWifiCredsOnPairFail) {
+        deleteWifiCredFromFlash();
+      }
+      
       PrintDebug("User Cancelled Pairing", PRINT_GENERAL_DEBUG);
       lcdWrite("Cancelled", "");
       startTimout(DISPLAY_TIMEOUT);
@@ -3227,6 +3454,10 @@ void loop() {
       isPairing = false;
       androidPaired = false;
       bt_NotifyStatus(CMD_BT_IDLE);
+      if (clearWifiCredsOnPairFail) {
+        deleteWifiCredFromFlash();
+      }
+
       lcdWrite("Timeout", "");
       startTimout(DISPLAY_TIMEOUT);
       buzzerOn(1, 2000, 0);
@@ -3238,8 +3469,10 @@ void loop() {
     if (subCasePtr == 0) {
       if (gotWifiCredentials && !ssid.isEmpty() && !password.isEmpty()) {
         PrintDebug("Pairing: got BT credentials, connecting WiFi", PRINT_WIFI_DEBUG);
-        // Refresh pairing window for WiFi + MQTT + discover
         startTimout(PAIR_TIMEOUT);
+        if (!isWifiConnected) {
+          wifiCasePtr = 3;
+        }
         subCasePtr = 1;
         lcdWrite("Pairing...", "WiFi...");
       }
@@ -3248,40 +3481,41 @@ void loop() {
 
     // Phase 1: wait for WiFi
     if (subCasePtr == 1) {
-      mqttServiceLoop();
       if (isWifiConnected || WiFi.status() == WL_CONNECTED) {
         isWifiConnected = true;
+        // Kick MQTT handshake (needed when WiFi was already up before pairing)
+        gotPing = false;
+        isMqttServiceConnected = false;
+        wifiCasePtr = 5;
         subCasePtr = 2;
-        lcdWrite("Pairing...", "Connecting...");
+        lcdWrite("Pairing...", "MQTT...");
       }
       break;
     }
 
     // Phase 2: wait for MQTT connected + base ping
     if (subCasePtr == 2) {
-      mqttServiceLoop();
-
-      if (mqttServer.connected() && isMqttServiceConnected) {
-        // Fresh window for discover / FOUND_MONITOR
-        startTimout(PAIR_TIMEOUT);
+      if (isMqttServiceConnected) {
         buzzerOn(1, 500, 0);
         subCasePtr = 3;
         lcdWrite("Click SYNC", "on Android...");
+        
+        // Fresh window for discover / FOUND_MONITOR
+        startTimout(PAIR_TIMEOUT);
       }
       break;
     }
 
     // Phase 3: wait for #FOUND_MONITOR (MQTT discover already answered while isPairing)
     if (subCasePtr == 3) {
-      mqttServiceLoop();
-
       if (androidPaired) {
-        timerAlarmDisable(timer);
         isPairing = false;
-        bt_NotifyStatus(CMD_BT_IDLE);
+        saveSettingsToFlash();
+        timerAlarmDisable(timer);
+        //bt_NotifyStatus(CMD_BT_IDLE);
+        
         // Paired again — restore green LED if MQTT is still up
-        if (mqttServer.connected()) {
-          isMqttServiceConnected = true;
+        if (isMqttServiceConnected) {
           digitalWrite(LED_MQTT_CONNECTED, HIGH);
         }
 
@@ -3290,16 +3524,27 @@ void loop() {
         buzzerOn(4, 100, 50);
         startTimout(DISPLAY_TIMEOUT);
         mainCasePtr++;
-        break;
       }
-    }
+      break;
+    } 
   } break;
 
-  // (isPairing) Message Delay
+  // Rebooting (Message)
   case 12: {
     if (timeoutFlag) {
       timeoutFlag = false;
-      mainCasePtr = CASE_HOME;
+      PrintDebug("Rebooting...", PRINT_GENERAL_DEBUG);
+      lcdWrite("Rebooting...", "");
+      startTimout(DISPLAY_TIMEOUT);
+      mainCasePtr++;
+    }
+  } break;
+
+  // Message Delay
+  case 13: {
+    if (timeoutFlag) {
+      timeoutFlag = false;
+      ESP.restart();
     }
   } break;
 
@@ -3938,7 +4183,7 @@ case 35:{
     }
 
     if (isWifiConnected) {
-      mqttReportTag();
+      pendingMqttReportTag = true;
     }
 
     startTimout(3);
@@ -3972,7 +4217,7 @@ case 35:{
     if (oldDistance != wheelDistance) {
       oldDistance = wheelDistance;
       lcdWrite("Distance: " + String(wheelDistance) + "m", "Live", false);
-      mqttReportLiveIotData();
+      pendingMqttReportLive = true;
     }
 
     // Android Disconnected
@@ -3982,30 +4227,102 @@ case 35:{
   } break;
 
   // Factory Reset -----------------------------------
-  // Trigger: BACK x 5 on home (within 5 seconds)
+  // Trigger: BACK x 5 on home (within 5 seconds) → enter PIN 1852
   case 80: {
-    lcdWrite("Factory Reset?", "(Ent,Back)");
+    factoryResetPinIndex = 0;
+    factoryResetPin[0] = '\0';
     enterKeyPressed = false;
     backKeyPressed = false;
+    newNumKeyPressed = false;
+    lcdWrite("Factory Reset", "PIN: ");
     mainCasePtr++;
   } break;
 
   case 81: {
-    if (backKeyPressed) {
-      backKeyPressed = false;
-      lcdWrite("Cancelled", "");
-      startTimout(DISPLAY_TIMEOUT);
-      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
-      break;
-    }
-
-    if (enterKeyPressed) {
-      enterKeyPressed = false;
+    if(skipResetPin){
+      skipResetPin = false;
       lcdWrite("Factory Reset", "Erasing...");
       buzzerOn(3, 100, 100);
       factoryReset();
       delay(1500);
       ESP.restart();
+      break;
+    }
+
+    if (backKeyPressed) {
+      backKeyPressed = false;
+      newNumKeyPressed = false;
+      key[0] = '\0';
+
+      if (factoryResetPinIndex > 0) {
+        factoryResetPin[--factoryResetPinIndex] = '\0';
+        lcdWrite("Factory Reset", String("PIN: ") + factoryResetPin);
+      } else {
+        lcdWrite("Cancelled", "");
+        startTimout(DISPLAY_TIMEOUT);
+        mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+      }
+      break;
+    }
+
+    if (enterKeyPressed) {
+      enterKeyPressed = false;
+      if (strcmp(factoryResetPin, FACTORY_RESET_PIN) == 0) {
+        lcdWrite("Factory Reset", "Erasing...");
+        buzzerOn(3, 100, 100);
+        factoryReset();
+        delay(1500);
+        ESP.restart();
+      } else {
+        buzzerOn(2, 150, 100);
+        lcdWrite("Wrong PIN", "");
+        startTimout(DISPLAY_TIMEOUT);
+        mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+      }
+      break;
+    }
+    
+
+    if (newNumKeyPressed && factoryResetPinIndex < sizeof(factoryResetPin) - 1) {
+      newNumKeyPressed = false;
+      bool isDigitKey = (key[1] == '\0' && key[0] >= '0' && key[0] <= '9');
+      if (isDigitKey) {
+        factoryResetPin[factoryResetPinIndex++] = key[0];
+        factoryResetPin[factoryResetPinIndex] = '\0';
+        lcdWrite("Factory Reset", String("PIN: ") + factoryResetPin);
+      }
+    }
+  } break;
+
+  // Battery Low — wait for charge; radios stay off via wifiCasePtr 16
+  case CASE_BATTERY_LOW: {
+    if (!batteryLow) {
+      clearBatteryPowerSave();
+      // pendingBatteryLcdWake in loop() re-inits LCD and sets CASE_HOME
+      break;
+    }
+
+    // Keep backlight off after the initial warning
+    if (timeoutFlag) {
+      timeoutFlag = false;
+      lcd_i2c.noBacklight();
+    }
+
+    if (newBatReadingAvailable) {
+      newBatReadingAvailable = false;
+      bool wasOff = batteryPowerSaveActive;
+      lcdWrite("Battery Low", String(batteryLevel) + "%", true);
+      if (wasOff) {
+        lcd_i2c.noBacklight();
+      }
+    }
+
+    // Any Key - Wakes Backlight
+    if (wakeBacklight) {
+      wakeBacklight = false;
+      lcd_i2c.backlight();
+      lcdWrite("Battery Low", String(batteryLevel) + "%", true);
+      startTimout(DISPLAY_TIMEOUT);
     }
   } break;
 
