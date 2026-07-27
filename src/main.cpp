@@ -23,6 +23,7 @@
 const String VERSION = "V1.0";
 
 hw_timer_t *timer = NULL;
+//hw_timer_t *batLowAlertTmr = NULL;
 volatile bool timeoutFlag = false;
 time_t EPOCH_START_OF_TIME = 1700000000; // 2023-11-10 00:00:00
 Preferences prefs;
@@ -51,6 +52,7 @@ const int port = 8080;
 #define CASE_LIVE_WHEEL_DATA 70
 #define CASE_FACTORY_RESET 80
 #define CASE_BATTERY_LOW 200
+#define CASE_BATTERY_ALARM 201 // brief "Battery Low" then return
 #define CASE_DISPLAY_RETURN_HOME 4
 #define CASE_HOME 2
 
@@ -400,14 +402,27 @@ bool newOperatorsRecieved = false;
 bool wakeBacklight = false;
 
 // Battery
+#define BAT_MAX_COUNT 3650
+#define BAT_MIN_COUNT 3300
+#define BAT_LOW_ALARM 15 // percent — soft alert (beep + LCD), keep working
+#define BAT_LOW_ALARM_INTERVAL_MS 30000UL  // Battery low Alert Interval
+#define BAT_LOW_ALARM_REPEAT 10  // Battery low Alert Repeat Alert
+
+int batteryLowAlarmRepeatCount = 0;
 int batteryLevel = 0; // Percentage
 bool batteryLow = false;
 bool batteryPowerSaveActive = false;
 volatile bool pendingBatteryLcdSleep = false; // loop(): re-init LCD, backlight off
 volatile bool pendingBatteryLcdWake = false;  // loop(): re-init LCD, home screen
-#define BAT_MAX_COUNT 4200
-#define BAT_MIN_COUNT 3300
-#define BAT_LOW 3300
+volatile bool pendingBatteryAlarm = false;    // loop(): brief alert, then resume
+bool batteryAlarmLatched = false;             // LCD alert once until % recovers
+int mainCasePtrBeforeBatteryAlarm = CASE_HOME;
+char lcdLine1BeforeAlarm[17] = {0};
+char lcdLine2BeforeAlarm[17] = {0};
+bool lcdShowMeasureCntBeforeAlarm = false;
+unsigned long batteryAlarmDeadlineMs = 0;
+unsigned long batteryAlarmNextBeepMs = 0;      // periodic beep while still low
+
 
 // Debug
 const bool PRINT_ERRORS = true;
@@ -548,7 +563,8 @@ void IRAM_ATTR onTimerOneSec() {
       wheelTicksCount+=11;
       wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
       wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
-    }else{
+    }
+    else{
       timerAlarmDisable(timer);
     }
   } 
@@ -838,9 +854,9 @@ void GeneralTask(void *parameter) {
         batteryLevel = 100; // Cap at 100%
       }
       if (batteryLevel <= 0){
-        batteryLevel = 0; // Cap at 100%
+        batteryLevel = 0;
       } 
-      if(adcValue < BAT_LOW){
+      if(adcValue < BAT_MIN_COUNT){
         batteryLow = true;
       }else{
         batteryLow = false;
@@ -850,6 +866,22 @@ void GeneralTask(void *parameter) {
         applyBatteryPowerSave();
       } else if (!batteryLow && batteryPowerSaveActive) {
         clearBatteryPowerSave();
+      }
+
+      // Soft alarm: % below threshold — LCD + beep, up to BAT_LOW_ALARM_REPEAT times
+      if (!batteryLow && !batteryPowerSaveActive) {
+        if (batteryLevel < BAT_LOW_ALARM) {
+          if (!batteryAlarmLatched) {
+            batteryAlarmLatched = true;
+            batteryLowAlarmRepeatCount = 0;
+            pendingBatteryAlarm = true;
+            batteryAlarmNextBeepMs = millis() + BAT_LOW_ALARM_INTERVAL_MS;
+          }
+        } else {
+          batteryAlarmLatched = false; // re-arm when charged above threshold
+          batteryLowAlarmRepeatCount = 0;
+          batteryAlarmNextBeepMs = 0;
+        }
       }
 
       newBatReadingAvailable = true;
@@ -1716,7 +1748,8 @@ void applyBatteryPowerSave() {
   digitalWrite(LED_WIFI_CONNECTED, LOW);
   digitalWrite(LED_MQTT_CONNECTED, LOW);
   digitalWrite(TAG_LED, LOW);
-
+  
+  buzzerOn(1, 1000, 0);
   setCpuFrequencyMhz(80);
   // LCD/I2C only from loop() — avoid Wire from FreeRTOS tasks
   pendingBatteryLcdSleep = true;
@@ -1726,6 +1759,7 @@ void applyBatteryPowerSave() {
   isMqttServiceConnected = false;
   isWifiConnected = false;
   wifiCasePtr = 16;
+  
 }
 void clearBatteryPowerSave() {
   if (!batteryPowerSaveActive) {
@@ -3123,6 +3157,39 @@ void loop() {
     mainCasePtr = CASE_HOME; // redraw Ready / No Session
   }
 
+  // Soft battery alarm — show message, then return to previous screen
+  if (pendingBatteryAlarm && mainCasePtr != CASE_BATTERY_ALARM &&
+      mainCasePtr != CASE_BATTERY_LOW) {
+    pendingBatteryAlarm = false;
+    if (batteryLowAlarmRepeatCount < BAT_LOW_ALARM_REPEAT) {
+      batteryLowAlarmRepeatCount++;
+      mainCasePtrBeforeBatteryAlarm = mainCasePtr;
+      strlcpy(lcdLine1BeforeAlarm, lcdLine1, sizeof(lcdLine1BeforeAlarm));
+      strlcpy(lcdLine2BeforeAlarm, lcdLine2, sizeof(lcdLine2BeforeAlarm));
+      lcdShowMeasureCntBeforeAlarm = lcdShowMeasureCnt;
+      buzzerOn(1, 250, 0);
+      lcd_i2c.backlight();
+      lcdWrite("Battery Low", "", true);
+      // Dedicated deadline — do not steal startTimout() from pairing / UI
+      batteryAlarmDeadlineMs = millis() + (DISPLAY_TIMEOUT * 1000UL);
+      if (batteryLowAlarmRepeatCount < BAT_LOW_ALARM_REPEAT) {
+        batteryAlarmNextBeepMs = millis() + BAT_LOW_ALARM_INTERVAL_MS;
+      } else {
+        batteryAlarmNextBeepMs = 0; // done alerting this low-battery episode
+      }
+      mainCasePtr = CASE_BATTERY_ALARM;
+    }
+  }
+
+  // While still below BAT_LOW_ALARM: repeat beep + LCD until BAT_LOW_ALARM_REPEAT
+  if (batteryAlarmLatched && !batteryLow && !batteryPowerSaveActive &&
+      batteryLevel < BAT_LOW_ALARM && mainCasePtr != CASE_BATTERY_ALARM &&
+      !pendingBatteryAlarm && batteryAlarmNextBeepMs != 0 &&
+      batteryLowAlarmRepeatCount < BAT_LOW_ALARM_REPEAT &&
+      (long)(millis() - batteryAlarmNextBeepMs) >= 0) {
+    pendingBatteryAlarm = true;
+  }
+
   switch (mainCasePtr) {
 
   // Splash
@@ -4294,6 +4361,20 @@ case 35:{
     }
   } break;
 
+  // Soft battery alarm — temporary overlay, then resume prior case
+  case CASE_BATTERY_ALARM: {
+    if (batteryAlarmDeadlineMs != 0 &&
+        (long)(millis() - batteryAlarmDeadlineMs) >= 0) {
+      batteryAlarmDeadlineMs = 0;
+      if (lcdShowMeasureCntBeforeAlarm) {
+        lcdWrite(lcdLine1BeforeAlarm, lcdLine2BeforeAlarm, true);
+      } else {
+        lcdWrite(lcdLine1BeforeAlarm, lcdLine2BeforeAlarm);
+      }
+      mainCasePtr = mainCasePtrBeforeBatteryAlarm;
+    }
+  } break;
+
   // Battery Low — wait for charge; radios stay off via wifiCasePtr 16
   case CASE_BATTERY_LOW: {
     if (!batteryLow) {
@@ -4311,7 +4392,7 @@ case 35:{
     if (newBatReadingAvailable) {
       newBatReadingAvailable = false;
       bool wasOff = batteryPowerSaveActive;
-      lcdWrite("Battery Low", String(batteryLevel) + "%", true);
+      lcdWrite("Battery Low", "", true);
       if (wasOff) {
         lcd_i2c.noBacklight();
       }
@@ -4321,7 +4402,7 @@ case 35:{
     if (wakeBacklight) {
       wakeBacklight = false;
       lcd_i2c.backlight();
-      lcdWrite("Battery Low", String(batteryLevel) + "%", true);
+      lcdWrite("Battery Low",  "", true);
       startTimout(DISPLAY_TIMEOUT);
     }
   } break;
