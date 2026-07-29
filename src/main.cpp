@@ -1,7 +1,6 @@
 // ESP32 GeoFence Monitor
 
 #include "FS.h"
-#include "pgmspace.h"
 #include "time.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -36,6 +35,8 @@ String password = "";
 String mqttUser = "";
 String mqttPassword = "";
 char serverIP[16];
+volatile bool pendingMqttServerUpdate = false; // wifi task: mqttServer.setServer(serverIP)
+bool requestFreshMqttBrokerIp = false;         // ask base for current broker IP over BLE
 const int port = 8080;
 
 #define WHEEL_DEBOUNCE_DELAY 10
@@ -434,7 +435,7 @@ const bool PRINT_BT_DEBUG = true;
 const bool PRINT_DEBOUNCE_DEBUG = true;
 bool simulateWheelDistance = false;
 bool skipResetPin = true;
-bool showBatAdcCount = true; // line2 suffix: "1234 85%" (ADC + percent)
+bool showBatAdcCount = false; // line2 suffix: "1234 85%" (ADC + percent)
 
 
 // LittleFS Filenames
@@ -476,6 +477,7 @@ void factoryReset();
 void mqttSendPing();
 bool mqttConnect();
 void readWifiCredFromFlash();
+bool mqttBrokerOnLocalSubnet();
 String readOperatorVerFile();
 void saveOperatorVerToFile(const char *ver);
 void loadOperatorsFromJsonArray(JsonArray operatorsArray);
@@ -904,6 +906,13 @@ void wifiConnectTask(void *parameter) {
     // All MQTT client I/O stays on this task
     mqttProcessDeferred();
 
+    if (pendingMqttServerUpdate) {
+      pendingMqttServerUpdate = false;
+      mqttServer.setServer(serverIP, 1883);
+      PrintDebug(String("MQTT server set to ") + serverIP + ":1883",
+                 PRINT_WIFI_DEBUG);
+    }
+
     if (batteryLow && wifiCasePtr != 16) {
       wifiCasePtr = 16;
     }
@@ -958,9 +967,15 @@ void wifiConnectTask(void *parameter) {
         PrintDebug("Got Wifi Credentials ... ", PRINT_WIFI_DEBUG);
         PrintDebug("SSID: " + ssid, PRINT_WIFI_DEBUG);
        
-        isWifiConnected = false;
         isMqttServiceConnected = false;
-        wifiCasePtr++;
+        if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
+          // Already on this network — only refresh MQTT broker IP
+          isWifiConnected = true;
+          wifiCasePtr = 4;
+        } else {
+          isWifiConnected = false;
+          wifiCasePtr = 3;
+        }
       }
     } break;
 
@@ -982,6 +997,20 @@ void wifiConnectTask(void *parameter) {
 
         isWifiConnected = true;
         digitalWrite(LED_WIFI_CONNECTED, HIGH); // Red
+
+        // Stale flash broker IP after hotspot subnet change (e.g. 10.35.x vs 10.134.x)
+        if (serverIP[0] != '\0' && !mqttBrokerOnLocalSubnet()) {
+          PrintDebug(String("MQTT IP outdated: ") + serverIP +
+                         " (LAN " + ip + ") — request BT credentials",
+                     PRINT_WIFI_DEBUG);
+          gotWifiCredentials = false;
+          requestFreshMqttBrokerIp = true;
+          if (isBluetoothConnected) {
+            bt_NotifyStatus(CMD_BT_PAIRING);
+          }
+          wifiCasePtr = 2;
+          break;
+        }
 
         PrintDebug(String("Start MQTT ... ") + serverIP + ":1883",
                    PRINT_WIFI_DEBUG);
@@ -1117,19 +1146,19 @@ void wifiConnectTask(void *parameter) {
       }
 
       // Push measurements
-      //if (iotDataCount > 0 && !isSessionOpen) {
-      //  wifiCasePtr = 20;
-      //}
+      if (iotDataCount > 0 && !isSessionOpen) {
+       wifiCasePtr = 20;
+      }
 
       // Push Manually
-      if (newNumKeyPressed) {
-        newNumKeyPressed = false;
+      // if (newNumKeyPressed) {
+      //   newNumKeyPressed = false;
     
-        if(strcmp(key, KEY_0) == 0)
-        {
-          wifiCasePtr = 20;
-        }
-      }
+      //   if(strcmp(key, KEY_0) == 0)
+      //   {
+      //     wifiCasePtr = 20;
+      //   }
+      // }
       
       vTaskDelay(500 / portTICK_PERIOD_MS);
     } break;
@@ -1749,7 +1778,6 @@ void applyBatteryPowerSave() {
   digitalWrite(LED_MQTT_CONNECTED, LOW);
   digitalWrite(TAG_LED, LOW);
   
-  buzzerOn(1, 1000, 0);
   setCpuFrequencyMhz(80);
   // LCD/I2C only from loop() — avoid Wire from FreeRTOS tasks
   pendingBatteryLcdSleep = true;
@@ -2106,39 +2134,39 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
     // FOUND MONITOR (Pair Done) (Save Settings to FLASH)
     if (_cmd == MQTT_CMD_FOUND_MONITOR) {
-      
-
       // iotType
       const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
-      if (iotType)
+      if (iotType && iotType[0])
         strlcpy(settingsIotType, iotType, sizeof(settingsIotType));
-      else
-        settingsIotType[0] = '\n';
 
       // Ticks per Meter
-      settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
+      if (!_payloadJson[JSON_SET_TICKS_PER_M].isNull()) {
+        settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
+      }
 
       // iotName
       const char *iotName = _payloadJson[JSON_IOT_NAME].as<const char *>();
-      if (iotName)
+      if (iotName && iotName[0])
         strlcpy(settingsIotName, iotName, sizeof(settingsIotName));
-      else
-        settingsIotName[0] = '\n';
 
-      // IOT Monitor Doc ID
-      const char *monId = _payloadJson[JSON_MON_DOC_ID];
-      if (monId) {
-        strncpy(settingsMonDocId, monId, sizeof(settingsMonDocId) - 1);
-        settingsMonDocId[sizeof(settingsMonDocId) - 1] =
-            '\0'; // ensure null termination
+      // Monitor Doc ID — required for a successful re-pair
+      const char *monId = _payloadJson[JSON_MON_DOC_ID].as<const char *>();
+      if (monId && monId[0]) {
+        strlcpy(settingsMonDocId, monId, sizeof(settingsMonDocId));
+        PrintDebug(String("FOUND_MONITOR monDocId: ") + settingsMonDocId,
+                   PRINT_FLASH_DEBUG);
+      } else {
+        PrintDebug("FOUND_MONITOR missing monDocId — keeping unpaired",
+                   PRINT_ERRORS);
+        return;
       }
 
       // User Doc ID
-      const char *userId = _payloadJson[JSON_USER_DOC_ID];
-      if (userId) {
-        strncpy(settingsUserDocId, userId, sizeof(settingsUserDocId) - 1);
-        settingsUserDocId[sizeof(settingsUserDocId) - 1] =
-            '\0'; // ensure null termination
+      const char *userId = _payloadJson[JSON_USER_DOC_ID].as<const char *>();
+      if (userId && userId[0]) {
+        strlcpy(settingsUserDocId, userId, sizeof(settingsUserDocId));
+        PrintDebug(String("FOUND_MONITOR userDocId: ") + settingsUserDocId,
+                   PRINT_FLASH_DEBUG);
       }
 
       MqttJsonDoc mqttPacket;
@@ -2294,7 +2322,7 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
     isBluetoothConnected = true;
 
     // If already in pair mode, tell the base immediately
-    if (isPairing) {
+    if (isPairing || requestFreshMqttBrokerIp) {
       bt_NotifyStatus(CMD_BT_PAIRING);
     }
   }
@@ -2363,16 +2391,25 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
           PrintDebug("WiFi Credentials did not change", PRINT_WIFI_DEBUG);
         }
 
-        PrintDebug("SSID: " + ssid, true);
+        PrintDebug(String("MQTT broker IP: ") + serverIP, PRINT_WIFI_DEBUG);
         // PrintDebug("Password: " + password, PRINT_CREDENTIALS_DEBUG);
 
         gotWifiCredentials = true;
-        // New / re-provisioned creds — allow MQTT again after SHOESH
         mqttBlockedByBase = false;
+        requestFreshMqttBrokerIp = false;
+        pendingMqttServerUpdate = true;
+        // If WiFi already up, reconnect MQTT to (possibly new) broker now
+        if (WiFi.status() == WL_CONNECTED) {
+          isMqttServiceConnected = false;
+          wifiCasePtr = 5;
+        }
 
         // Tell base once to stop resending credentials (frees BT RF for MQTT)
         if (isPairing && !btWifiOkNotified) {
           btWifiOkNotified = true;
+          bt_NotifyStatus(CMD_BT_WIFI_OK);
+        } else if (!isPairing && !newIPMatch) {
+          // IP refresh without full pair UI
           bt_NotifyStatus(CMD_BT_WIFI_OK);
         }
       } else {
@@ -2391,7 +2428,7 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
     PrintDebug("BT Client subscribed to notifications", PRINT_BT_DEBUG);
 
     // Base is listening — push current pairing state
-    if (isPairing) {
+    if (isPairing || requestFreshMqttBrokerIp) {
       bt_NotifyStatus(CMD_BT_PAIRING);
     } else {
       bt_NotifyStatus(CMD_BT_IDLE);
@@ -2468,30 +2505,34 @@ void bt_StartAdvertising() {
 void saveSettingsToFlash() {
   char _iotType[32];
   char _iotName[32];
-  char _uid[32];
-  char _monid[32];
+  char _uid[sizeof(settingsUserDocId)];
+  char _monid[sizeof(settingsMonDocId)];
   int _ticks = 0;
 
   prefs.begin(FLASH_SETTINGS, false); // read-write
 
-  prefs.getString(FLASH_SET_IOT_NAME, _iotName, sizeof(settingsIotName));
-  prefs.getString(FLASH_SET_IOT_TYPE, _iotType, sizeof(settingsIotType));
-  prefs.getString(FLASH_SET_MONITOR_DOC_ID, _monid, sizeof(settingsMonDocId));
-  prefs.getString(FLASH_SET_USER_DOC_ID, _uid, sizeof(settingsUserDocId));
-  prefs.getInt(FLASH_SET_TICKS_PER_M, _ticks);
+  prefs.getString(FLASH_SET_IOT_NAME, _iotName, sizeof(_iotName));
+  prefs.getString(FLASH_SET_IOT_TYPE, _iotType, sizeof(_iotType));
+  prefs.getString(FLASH_SET_MONITOR_DOC_ID, _monid, sizeof(_monid));
+  prefs.getString(FLASH_SET_USER_DOC_ID, _uid, sizeof(_uid));
+  _ticks = prefs.getInt(FLASH_SET_TICKS_PER_M, 0);
 
-  // Save New
+  // Save New — remove first so NVS accepts a different-length string
   if (strcmp(settingsMonDocId, _monid) != 0) {
-    prefs.putString(FLASH_SET_MONITOR_DOC_ID, (char *)settingsMonDocId);
+    prefs.remove(FLASH_SET_MONITOR_DOC_ID);
+    prefs.putString(FLASH_SET_MONITOR_DOC_ID, settingsMonDocId);
   }
   if (strcmp(settingsUserDocId, _uid) != 0) {
-    prefs.putString(FLASH_SET_USER_DOC_ID, (char *)settingsUserDocId);
+    prefs.remove(FLASH_SET_USER_DOC_ID);
+    prefs.putString(FLASH_SET_USER_DOC_ID, settingsUserDocId);
   }
   if (strcmp(settingsIotType, _iotType) != 0) {
-    prefs.putString(FLASH_SET_IOT_TYPE, (char *)settingsIotType);
+    prefs.remove(FLASH_SET_IOT_TYPE);
+    prefs.putString(FLASH_SET_IOT_TYPE, settingsIotType);
   }
   if (strcmp(settingsIotName, _iotName) != 0) {
-    prefs.putString(FLASH_SET_IOT_NAME, (char *)settingsIotName);
+    prefs.remove(FLASH_SET_IOT_NAME);
+    prefs.putString(FLASH_SET_IOT_NAME, settingsIotName);
   }
   if (settingsTicksPerMeter != _ticks) {
     prefs.putInt(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);
@@ -2689,6 +2730,18 @@ void readWifiCredFromFlash() {
     PrintDebug(String("readWifiCredFromFlash(): ") + e.what(), PRINT_ERRORS);
     return;
   }
+}
+bool mqttBrokerOnLocalSubnet() {
+  if (serverIP[0] == '\0' || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  IPAddress local = WiFi.localIP();
+  IPAddress broker;
+  if (!broker.fromString(serverIP)) {
+    return false;
+  }
+  // Phone hotspots are typically /24 — broker must be on same LAN as us
+  return local[0] == broker[0] && local[1] == broker[1] && local[2] == broker[2];
 }
 
 // Read/Write File (Session Number)
@@ -3455,6 +3508,9 @@ void loop() {
     btWifiOkNotified = false;
     mqttBlockedByBase = false; // pairing may resume MQTT to this base
     isMqttServiceConnected = false;
+    // Clear old monitor link so re-pair cannot keep a stale monDocId
+    settingsMonDocId[0] = '\0';
+    settingsUserDocId[0] = '\0';
     // Only wipe WiFi on fail if this was a first pair (no stored creds yet)
     clearWifiCredsOnPairFail = ssid.isEmpty() || password.isEmpty();
     btnPairPressed = false;
@@ -3565,7 +3621,7 @@ void loop() {
       if (isMqttServiceConnected) {
         buzzerOn(1, 500, 0);
         subCasePtr = 3;
-        lcdWrite("Click SYNC", "on Android...");
+        lcdWrite("Click PAIR", "in App...");
         
         // Fresh window for discover / FOUND_MONITOR
         startTimout(PAIR_TIMEOUT);
