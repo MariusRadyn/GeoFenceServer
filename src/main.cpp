@@ -19,7 +19,10 @@
 #include <vector>
 #include <driver/gpio.h>
 
-const String VERSION = "V1.0";
+#ifndef FW_VERSION
+#define FW_VERSION "V1.1.dev"
+#endif
+const String VERSION = FW_VERSION;
 
 hw_timer_t *timer = NULL;
 //hw_timer_t *batLowAlertTmr = NULL;
@@ -433,9 +436,11 @@ const bool PRINT_CREDENTIALS_DEBUG = true;
 const bool PRINT_WIFI_DEBUG = true;
 const bool PRINT_BT_DEBUG = true;
 const bool PRINT_DEBOUNCE_DEBUG = true;
-bool simulateWheelDistance = false;
+const bool SIMULATE_WHEEL_DISTANCE = false; // debug: fake ticks while measuring
+const bool SHOW_ADC_COUNT = false; // debug: fake ticks while measuring
+
+bool simulateWheelDistance = false;       // runtime — armed each measure start
 bool skipResetPin = true;
-bool showBatAdcCount = false; // line2 suffix: "1234 85%" (ADC + percent)
 
 
 // LittleFS Filenames
@@ -1669,7 +1674,7 @@ void lcdWrite(const char* line1, const char* line2, bool showMeasureCnt) {
   
   // ---- LINE 2 ----
   char right[12];
-  if (showBatAdcCount) {
+  if (SHOW_ADC_COUNT) {
     // 4-digit ADC + percent, e.g. "1234 85%"
     int adcValue = analogRead(ADC_BATTERY);
     snprintf(right, sizeof(right), "%4d%s", adcValue, percent);
@@ -1890,109 +1895,6 @@ void uuid4_hex(char out[33]) {
 }
 
 // MQTT
-void mqttTX(const JsonDocument &msg, const String &topic) {
-  if (!isWifiConnected) {
-    Serial.println("WiFi not connected");
-    return;
-  }
-
-  if (!mqttServer.connected()) {
-    Serial.println("MQTT not connected");
-    return;
-  }
-
-  size_t payloadSize = measureJson(msg);
-  char payload[MQTT_PAYLOAD_MAX];
-
-  if (payloadSize >= sizeof(payload)) {
-    Serial.printf("MQTT payload too large %i>%i", payloadSize, sizeof(payload));
-    return;
-  }
-
-  size_t len = serializeJson(msg, payload);
-  payload[len] = '\0'; // Null-terminate the string in case buffer overflows
-  bool ok = mqttServer.publish(topic.c_str(), payload, len);
-
-  Serial.print("MQTT TX: ");
-  Serial.println(payload); // Safe, prints the JSON string
-  Serial.printf("MQTT payload: %i/%i \n", payloadSize, sizeof(payload));
-
-  if (ok) {
-    Serial.println("OK");
-  } else {
-    Serial.println("MQTT publish failed");
-  }
-}
-void mqttSendPing() {
-  gotPing = false;
-  MqttJsonDoc mqttPacket;
-
-  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
-  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = "";
-  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
-  mqttPacket[MQTT_JSON_PAYLOAD] = "";
-  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_PING;
-
-  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-}
-void mqttSendSync() {
-  gotSync = false;
-  MqttJsonDoc mqttPacket;
-
-  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
-  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = "";
-  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
-  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_SYNC;
-
-  String iotType = settingsIotType[0] ? settingsIotType : "";
-  
-  if (iotType.isEmpty()) {
-    PrintDebug("IOT Type is empty, cannot send SYNC", PRINT_ERRORS);
-    return;
-  }
-
-  // Distance Wheel (Sync Operarators)
-  if (iotType == IOT_TYPE_WHEEL) {
-    JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
-    String operateVer = readOperatorVerFile();
-    
-    payload[JSON_OPERATORS_VERSION] = operateVer;
-    payload[JSON_IOT_TYPE] = settingsIotType;
-
-    mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-    return;
-  }
-  else{  
-    PrintDebug("Sync Error: Unknown IOT Type: " + iotType, PRINT_ERRORS);
-  }
-}
-void mqttServiceLoop() {
-  mqttServer.loop();
-  if (pendingOperatorsUpdate) {
-    processPendingOperatorsUpdate();
-  }
-}
-void mqttProcessDeferred() {
-  // Must only run on wifiConnectTask — never from GeneralTask / BLE / ISR
-  
-  if (pendingMqttDisconnect) {
-    pendingMqttDisconnect = false;
-    if (mqttServer.connected()) {
-      mqttServer.disconnect();
-    }
-  }
-  if (mqttBlockedByBase || !mqttServer.connected()) {
-    return;
-  }
-  if (pendingMqttReportTag) {
-    pendingMqttReportTag = false;
-    mqttReportTag();
-  }
-  if (pendingMqttReportLive) {
-    pendingMqttReportLive = false;
-    mqttReportLiveIotData();
-  }
-}
 void mqttRx(char *topic, byte *payload, unsigned int length) {
   Serial.print("MQTT RX: ");
   Serial.write(payload, length);
@@ -2212,6 +2114,109 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
         queueOperatorsUpdate(operatorsArray);
       }
     }
+  }
+}
+void mqttTX(const JsonDocument &msg, const String &topic) {
+  if (!isWifiConnected) {
+    Serial.println("WiFi not connected");
+    return;
+  }
+
+  if (!mqttServer.connected()) {
+    Serial.println("MQTT not connected");
+    return;
+  }
+
+  size_t payloadSize = measureJson(msg);
+  char payload[MQTT_PAYLOAD_MAX];
+
+  if (payloadSize >= sizeof(payload)) {
+    Serial.printf("MQTT payload too large %i>%i", payloadSize, sizeof(payload));
+    return;
+  }
+
+  size_t len = serializeJson(msg, payload);
+  payload[len] = '\0'; // Null-terminate the string in case buffer overflows
+  bool ok = mqttServer.publish(topic.c_str(), payload, len);
+
+  Serial.print("MQTT TX: ");
+  Serial.println(payload); // Safe, prints the JSON string
+  Serial.printf("MQTT payload: %i/%i \n", payloadSize, sizeof(payload));
+
+  if (ok) {
+    Serial.println("OK");
+  } else {
+    Serial.println("MQTT publish failed");
+  }
+}
+void mqttSendPing() {
+  gotPing = false;
+  MqttJsonDoc mqttPacket;
+
+  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = "";
+  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  mqttPacket[MQTT_JSON_PAYLOAD] = "";
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_PING;
+
+  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+}
+void mqttSendSync() {
+  gotSync = false;
+  MqttJsonDoc mqttPacket;
+
+  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = "";
+  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_SYNC;
+
+  String iotType = settingsIotType[0] ? settingsIotType : "";
+  
+  if (iotType.isEmpty()) {
+    PrintDebug("IOT Type is empty, cannot send SYNC", PRINT_ERRORS);
+    return;
+  }
+
+  // Distance Wheel (Sync Operarators)
+  if (iotType == IOT_TYPE_WHEEL) {
+    JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
+    String operateVer = readOperatorVerFile();
+    
+    payload[JSON_OPERATORS_VERSION] = operateVer;
+    payload[JSON_IOT_TYPE] = settingsIotType;
+
+    mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+    return;
+  }
+  else{  
+    PrintDebug("Sync Error: Unknown IOT Type: " + iotType, PRINT_ERRORS);
+  }
+}
+void mqttServiceLoop() {
+  mqttServer.loop();
+  if (pendingOperatorsUpdate) {
+    processPendingOperatorsUpdate();
+  }
+}
+void mqttProcessDeferred() {
+  // Must only run on wifiConnectTask — never from GeneralTask / BLE / ISR
+  
+  if (pendingMqttDisconnect) {
+    pendingMqttDisconnect = false;
+    if (mqttServer.connected()) {
+      mqttServer.disconnect();
+    }
+  }
+  if (mqttBlockedByBase || !mqttServer.connected()) {
+    return;
+  }
+  if (pendingMqttReportTag) {
+    pendingMqttReportTag = false;
+    mqttReportTag();
+  }
+  if (pendingMqttReportLive) {
+    pendingMqttReportLive = false;
+    mqttReportLiveIotData();
   }
 }
 bool mqttConnect() {
@@ -3256,7 +3261,7 @@ void loop() {
         vTaskResume(ConnectWiFiTaskHandle);
 
         // Device ID on line 1 (full 16 cols; line2 would be truncated by bat %)
-        lcdWrite(myDeviceId, "");
+        lcdWrite(myDeviceId, VERSION);
         startTimout(5);
         subCasePtr = 1;
       } break;
@@ -3264,7 +3269,7 @@ void loop() {
       case 1: {
         if (timeoutFlag) {
           timeoutFlag = false;
-          lcdWrite("Wheel " + VERSION, "Connecting...");
+          lcdWrite("Connecting...", "");
           startTimout(DISPLAY_TIMEOUT);
           subCasePtr = SUB_CASE_NONE;
           mainCasePtr++;
@@ -3314,10 +3319,7 @@ void loop() {
     subCasePtr = SUB_CASE_NONE;
   } break;
 
-  // Home (Idle):
-  // ----------------------------------------------------------------
-  // - Wait for isPairing Button Press
-  // - Wait for Connection request 
+  // Home (Idle) ----------------------------------------------
   case 3: {
    
     // Battery Low
@@ -3398,9 +3400,8 @@ void loop() {
       break;
     }
 
-    // TX Live Data
+    // Live Monitor Data
     if (androidConnected) {
-      androidConnected = false;
       mainCasePtr = CASE_LIVE_WHEEL_DATA;
       break;
     }
@@ -3854,11 +3855,13 @@ void loop() {
       timeoutFlag = false;
       lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back,Stop)");
       mainCasePtr++;
-
-      //DEBUG
-      simulateWheelDistance = false;
-      startTimout(1);
-      //DEBUG
+      // Arm simulation for this measure pass (stop/cancel clears it)
+      simulateWheelDistance = SIMULATE_WHEEL_DISTANCE;
+      if (simulateWheelDistance) {
+        runningTime = 0;
+        timeoutFlag = false;
+        timerAlarmEnable(timer);
+      }
     }
   } break;
 
@@ -3898,6 +3901,7 @@ void loop() {
         if (backKeyPressed) {
           backKeyPressed = false;
           subCasePtr = SUB_CASE_NONE;
+          timeoutFlag = true; // re-enter measure screen + re-arm simulation
           mainCasePtr = 22;
         }
 
@@ -3921,6 +3925,7 @@ void loop() {
         if (backKeyPressed) {
           backKeyPressed = false;
           subCasePtr = SUB_CASE_NONE;
+          timeoutFlag = true; // re-enter measure screen + re-arm simulation
           mainCasePtr = 22;
         }
         
@@ -4319,10 +4324,12 @@ case 35:{
     }
   } break;
 
-  // Live Debug -----------------------------------
+  // Live Monitor -----------------------------------
 
   case 70: {
     lcdWrite("Distance: " + String(wheelDistance) + "m", "Live");
+    buzzerOn(2, 100, 100);
+
     isRunningLive = true;
     oldDistance = 0;
     wheelDistance = 0;
@@ -4345,6 +4352,7 @@ case 35:{
 
     // Android Disconnected
     if (!androidConnected) {
+      buzzerOn(1, 200, 100);
       mainCasePtr = CASE_HOME;
     }
   } break;
