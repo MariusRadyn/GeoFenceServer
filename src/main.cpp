@@ -112,6 +112,7 @@ bool mqttBlockedByBase = false;        // set by SHOESH; cleared on pair / new c
 volatile bool pendingMqttDisconnect = false;
 volatile bool pendingMqttReportTag = false;
 volatile bool pendingMqttReportLive = false;
+volatile bool pendingMqttDisconnectMonitor = false;
 
 // Button Debounce
 volatile bool debPairFallEdge = false;
@@ -147,6 +148,7 @@ const String MQTT_CMD_CALIBRATE = "#CALIBRATE";
 const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
 const String MQTT_CMD_ACK = "#ACK";
 const String MQTT_CMD_PING = "#PING";
+const String MQTT_CMD_FIND = "#FIND";
 const String MQTT_CMD_TAG_DATA = "#TAG_DATA";
 const String MQTT_CMD_LIVE_MONITOR_DATA = "#MONITOR_DATA";
 const String MQTT_CMD_IOT_DATA = "#IOT_DATA";
@@ -400,6 +402,8 @@ bool newBatReadingAvailable = false;
 int buzzerOnNrOfBeeps = 0;
 int buzzerOnTime = 0;
 int buzzerOffTime = 0;
+volatile bool locateActive = false;
+volatile int locateLedFlashesLeft = 0;
 bool showMqttWarning = true;
 volatile bool pendingOperatorsUpdate = false;
 bool newOperatorsRecieved = false;
@@ -498,6 +502,8 @@ bool readReadingsFromFlash(const char *key, IotData_Wheel &out);
 void mqttReportMyID();
 void mqttReportTag();
 void mqttReportLiveIotData();
+void mqttSendDisconnectMonitor();
+void requestLiveDisconnect(const char *reason);
 void mqttPushIotData(int);
 void uuid4_hex(char out[33]);
 void getAllReadings(std::vector<IotData_Wheel> &data);
@@ -659,7 +665,36 @@ void GeneralTask(void *parameter) {
           startup = false;
         }
       }
-    } 
+    }
+    // Find: flash all 3 LEDs together (10×) while buzzer beeps 4×
+    else if (locateActive && !batteryPowerSaveActive) {
+      static int locateDelay = 0;
+      static bool locateOn = false;
+      static int flashesLeft = 0;
+
+      int pending = locateLedFlashesLeft;
+      if (pending > 0) {
+        flashesLeft = pending;
+        locateLedFlashesLeft = 0;
+        locateOn = false;
+        locateDelay = 0;
+      }
+
+      if (locateDelay++ >= 150) {
+        locateDelay = 0;
+        locateOn = !locateOn;
+        int level = locateOn ? HIGH : LOW;
+        digitalWrite(LED_BLUETOOTH, level);
+        digitalWrite(LED_WIFI_CONNECTED, level);
+        digitalWrite(LED_MQTT_CONNECTED, level);
+        if (!locateOn && flashesLeft > 0) {
+          flashesLeft--;
+          if (flashesLeft <= 0) {
+            locateActive = false;
+          }
+        }
+      }
+    }
     // Battery Low
     else if (batteryLow || batteryPowerSaveActive) {
       static bool ledBatState = false;
@@ -722,6 +757,13 @@ void GeneralTask(void *parameter) {
       if(batteryLow){
         wakeBacklight = true;
       }
+
+      // Live monitor: any key drops the session and tells the app
+      if (isRunningLive) {
+        requestLiveDisconnect("key");
+        continue;
+      }
+
       // Control
       if (strcmp(key, KEY_ENTER) == 0)
         enterKeyPressed = true;
@@ -2093,6 +2135,32 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       gotPing = true;
     }
 
+    // FIND — locate this device among others (app Find button)
+    if (_cmd == MQTT_CMD_FIND) {
+      if (batteryPowerSaveActive) {
+        PrintDebug("FIND skipped — power save", PRINT_GENERAL_DEBUG);
+      } else {
+        int beeps = _payloadJson["beeps"] | 4;
+        int flashes = _payloadJson["ledFlashes"] | 10;
+        if (beeps <= 0)
+          beeps = 4;
+        if (flashes <= 0)
+          flashes = 10;
+        buzzerOn(beeps, 150, 100);
+        locateLedFlashesLeft = flashes;
+        locateActive = true;
+        PrintDebug("FIND locate", PRINT_GENERAL_DEBUG);
+      }
+
+      MqttJsonDoc mqttPacket;
+      mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+      mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
+      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+      mqttPacket[MQTT_JSON_PAYLOAD] = "";
+      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_FIND;
+      mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+    }
+
     // SETTINGS
     if (_cmd == MQTT_CMD_SETTINGS) {
       // TODO: Add List of Base Stations allowed.
@@ -2218,6 +2286,10 @@ void mqttProcessDeferred() {
     pendingMqttReportLive = false;
     mqttReportLiveIotData();
   }
+  if (pendingMqttDisconnectMonitor) {
+    pendingMqttDisconnectMonitor = false;
+    mqttSendDisconnectMonitor();
+  }
 }
 bool mqttConnect() {
   if (!mqttUser.isEmpty()) {
@@ -2225,6 +2297,33 @@ bool mqttConnect() {
                               mqttPassword.c_str());
   }
   return mqttServer.connect(myDeviceId.c_str());
+}
+void mqttSendDisconnectMonitor() {
+  MqttJsonDoc mqttPacket;
+
+  mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  mqttPacket[MQTT_JSON_TO_DEVICE_ID] = connectedDeviceId;
+  mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  mqttPacket[MQTT_JSON_PAYLOAD] = "";
+  mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_DISCONNECT_MONITOR;
+
+  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+}
+
+void requestLiveDisconnect(const char *reason) {
+  isRunningLive = false;
+  androidConnected = false;
+  pendingMqttDisconnectMonitor = true;
+  startKeyPressed = false;
+  stopKeyPressed = false;
+  enterKeyPressed = false;
+  backKeyPressed = false;
+  openKeyPressed = false;
+  closeKeyPressed = false;
+  newNumKeyPressed = false;
+  buzzerOn(1, 200, 100);
+  mainCasePtr = CASE_HOME;
+  PrintDebug(String("Live disconnect: ") + reason, PRINT_GENERAL_DEBUG);
 }
 void mqttReportLiveIotData() {
   MqttJsonDoc mqttPacket;
@@ -4337,10 +4436,12 @@ case 35:{
   } break;
 
   case 71: {
-    if (backKeyPressed) {
-      backKeyPressed = false;
-      isRunningLive = false;
-      mainCasePtr = CASE_HOME;
+    // Any key exits Live Monitor and tells the app to disconnect
+    if (startKeyPressed || stopKeyPressed || enterKeyPressed ||
+        backKeyPressed || openKeyPressed || closeKeyPressed ||
+        newNumKeyPressed) {
+      requestLiveDisconnect("key");
+      break;
     }
 
     // Wheel Moved
@@ -4352,6 +4453,7 @@ case 35:{
 
     // Android Disconnected
     if (!androidConnected) {
+      isRunningLive = false;
       buzzerOn(1, 200, 100);
       mainCasePtr = CASE_HOME;
     }
