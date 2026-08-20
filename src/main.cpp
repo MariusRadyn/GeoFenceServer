@@ -339,9 +339,13 @@ String prevKey = "";
 int pairModePressCount = 0;
 int calibrateModePressCount = 0;
 int factoryResetPressCount = 0;
+unsigned long pairModeLastPressMs = 0;
+unsigned long calibrateModeLastPressMs = 0;
+unsigned long factoryResetLastPressMs = 0;
 #define PAIR_MODE_PRESS_COUNT 5
 #define CALIBRATE_MODE_PRESS_COUNT 5
 #define FACTORY_RESET_PRESS_COUNT 5
+#define SECRET_PRESS_WINDOW_MS 5000
 #define FACTORY_RESET_PIN "1852"
 char factoryResetPin[5] = "";
 uint8_t factoryResetPinIndex = 0;
@@ -588,9 +592,8 @@ void IRAM_ATTR onTimerOneSec() {
 void startTimout(int seconds) {
   runningTime = seconds;
   timeoutFlag = false;
-  pairModePressCount = 0;
-  calibrateModePressCount = 0;
-  factoryResetPressCount = 0;
+  // Do not reset pair/calibrate/factory press counts here — other UI
+  // timeouts share this timer and were wiping mid-sequence presses.
   timerAlarmEnable(timer);
 }
 
@@ -770,14 +773,18 @@ void GeneralTask(void *parameter) {
       else if (strcmp(key, KEY_BACK) == 0) {
         backKeyPressed = true;
 
-        // Factory reset: BACK x 5 on home only
+        // Factory reset: BACK x 5 on home only (within 5s between presses)
         if ((mainCasePtr == CASE_HOME || mainCasePtr == 3) &&
             !isSessionOpen && !isRunningLive && !isPairing) {
-          if (factoryResetPressCount == 0) {
-            startTimout(5);
+          unsigned long now = millis();
+          if (factoryResetPressCount > 0 &&
+              (now - factoryResetLastPressMs) > SECRET_PRESS_WINDOW_MS) {
+            factoryResetPressCount = 0;
           }
+          factoryResetLastPressMs = now;
+          factoryResetPressCount++;
 
-          if (factoryResetPressCount++ >= FACTORY_RESET_PRESS_COUNT) {
+          if (factoryResetPressCount >= FACTORY_RESET_PRESS_COUNT) {
             factoryResetPressCount = 0;
             PrintDebug("Factory Reset MODE", PRINT_GENERAL_DEBUG);
             startFactoryReset = true;
@@ -790,16 +797,20 @@ void GeneralTask(void *parameter) {
       else if (strcmp(key, KEY_CLOSE) == 0)
         closeKeyPressed = true;
 
-      // Start / Calibration Mode (Press STOP x 6)
+      // Start / Calibration Mode (START x 5 within 5s between presses)
       else if (strcmp(key, KEY_START) == 0) {
         startKeyPressed = true;
 
         if (!isSessionOpen && !isRunningLive) {
-          if (calibrateModePressCount == 0) {
-            startTimout(5); // 5 seconds to enter isPairing mode
+          unsigned long now = millis();
+          if (calibrateModePressCount > 0 &&
+              (now - calibrateModeLastPressMs) > SECRET_PRESS_WINDOW_MS) {
+            calibrateModePressCount = 0;
           }
+          calibrateModeLastPressMs = now;
+          calibrateModePressCount++;
 
-          if (calibrateModePressCount++ >= CALIBRATE_MODE_PRESS_COUNT) {
+          if (calibrateModePressCount >= CALIBRATE_MODE_PRESS_COUNT) {
             calibrateModePressCount = 0;
             PrintDebug("Calibration MODE", PRINT_GENERAL_DEBUG);
             calibrationMode = true;
@@ -808,16 +819,21 @@ void GeneralTask(void *parameter) {
         }
       }
 
-      // Stop / Pair (Press STOP x 6)
+      // Stop / Pair (STOP x 5 on home only, within 5s between presses)
       else if (strcmp(key, KEY_STOP) == 0) {
         stopKeyPressed = true;
 
-        if (!isPairing && !isRunningLive) {
-          if (pairModePressCount == 0) {
-            startTimout(5); // 5 seconds to enter isPairing mode
+        if (!isPairing && !isRunningLive &&
+            (mainCasePtr == CASE_HOME || mainCasePtr == 3)) {
+          unsigned long now = millis();
+          if (pairModePressCount > 0 &&
+              (now - pairModeLastPressMs) > SECRET_PRESS_WINDOW_MS) {
+            pairModePressCount = 0;
           }
+          pairModeLastPressMs = now;
+          pairModePressCount++;
 
-          if (pairModePressCount++ >= PAIR_MODE_PRESS_COUNT) {
+          if (pairModePressCount >= PAIR_MODE_PRESS_COUNT) {
             pairModePressCount = 0;
             PrintDebug("Pairing MODE", PRINT_GENERAL_DEBUG);
             startPairing = true;
@@ -1028,8 +1044,13 @@ void wifiConnectTask(void *parameter) {
 
     // Connecting Wifi
     case 3: {
-       // Start WiFi Connection
+       // Start WiFi Connection (re-pair may land here after BT updated ssid/pw)
       PrintDebug("Connecting to Wifi ... ", PRINT_WIFI_DEBUG);
+      PrintDebug("SSID: " + ssid, PRINT_WIFI_DEBUG);
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(false);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+      }
       WiFi.begin(ssid, password);
       wifiCasePtr++;
     } break;
@@ -2483,8 +2504,14 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         ip.toCharArray(newIP, sizeof(newIP));
         newIPMatch = (strcmp(serverIP, newIP) == 0);
 
-        if (password != newPassword || ssid != newSsid || !newIPMatch || mqttPassword != newMqttPassword || mqttUser != newMqttUser) {
-          saveWifiCredToFlash(newSsid, newPassword, newIP, newMqttUser, newMqttPassword);
+        bool ssidOrPwChanged =
+            (password != newPassword || ssid != newSsid);
+        bool mqttCredChanged =
+            (mqttPassword != newMqttPassword || mqttUser != newMqttUser);
+
+        if (ssidOrPwChanged || !newIPMatch || mqttCredChanged) {
+          saveWifiCredToFlash(newSsid, newPassword, newIP, newMqttUser,
+                              newMqttPassword);
           ssid = newSsid;
           password = newPassword;
           mqttUser = newMqttUser;
@@ -2496,14 +2523,22 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         }
 
         PrintDebug(String("MQTT broker IP: ") + serverIP, PRINT_WIFI_DEBUG);
-        // PrintDebug("Password: " + password, PRINT_CREDENTIALS_DEBUG);
 
         gotWifiCredentials = true;
         mqttBlockedByBase = false;
         requestFreshMqttBrokerIp = false;
         pendingMqttServerUpdate = true;
-        // If WiFi already up, reconnect MQTT to (possibly new) broker now
-        if (WiFi.status() == WL_CONNECTED) {
+
+        // SSID/password change (or not associated): must WiFi.begin again.
+        // MQTT-only reconnect is not enough — ESP may still be on the old AP.
+        bool onCorrectWifi =
+            (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid);
+        if (ssidOrPwChanged || !onCorrectWifi) {
+          isWifiConnected = false;
+          isMqttServiceConnected = false;
+          WiFi.disconnect(false);
+          wifiCasePtr = 3;
+        } else {
           isMqttServiceConnected = false;
           wifiCasePtr = 5;
         }
@@ -3447,6 +3482,14 @@ void loop() {
       }
     }
 
+    // Pair mode (must run before stopKeyPressed clears/breaks)
+    if (startPairing) {
+      startPairing = false;
+      androidPaired = false;
+      mainCasePtr = CASE_PAIR;
+      break;
+    }
+
     // stop Key Pressed
     if (stopKeyPressed) {
       stopKeyPressed = false;
@@ -3476,14 +3519,6 @@ void loop() {
       lcdRefresh();
     }
     
-    // isPairing
-    if (startPairing) {
-      startPairing = false;
-      androidPaired = false;
-      mainCasePtr = CASE_PAIR;
-      break;
-    }
-
     // Factory Reset
     if (startFactoryReset) {
       startFactoryReset = false;
@@ -3595,7 +3630,9 @@ void loop() {
   } break;
 
   // (Pairing) Start ----------------------------------------
-  // Supports pairing with no WiFi/MQTT yet (credentials via Bluetooth first).
+  // Always waits for a fresh Bluetooth credential push first (even if flash
+  // already has WiFi settings). That is required when the base WiFi/MQTT
+  // password or SSID changed — old flash creds must not skip the BT step.
   // Phases (subCasePtr):
   //   0 = wait BT credentials
   //   1 = wait WiFi
@@ -3608,6 +3645,10 @@ void loop() {
     btWifiOkNotified = false;
     mqttBlockedByBase = false; // pairing may resume MQTT to this base
     isMqttServiceConnected = false;
+    // Always wait for a fresh BT credential push this pair session.
+    // Skipping this when flash still has OLD ssid/password breaks re-pair
+    // after the base WiFi/MQTT credentials change.
+    gotWifiCredentials = false;
     // Clear old monitor link so re-pair cannot keep a stale monDocId
     settingsMonDocId[0] = '\0';
     settingsUserDocId[0] = '\0';
@@ -3623,28 +3664,11 @@ void loop() {
     bt_StartAdvertising();
     bt_NotifyStatus(CMD_BT_PAIRING);
 
-    if (!ssid.isEmpty() && !password.isEmpty()) {
-      if (!isWifiConnected) {
-        wifiCasePtr = 3; // connect WiFi with stored creds
-        subCasePtr = 1;
-        lcdWrite("Pairing...", "WiFi...");
-      } else {
-        // Re-pair / already on WiFi: wifi task is often idle (case 9) after a
-        // prior ping. Clear + force MQTT reconnect/ping or UI waits forever.
-        gotPing = false;
-        wifiCasePtr = 5;
-        subCasePtr = 2;
-        lcdWrite("Pairing...", "MQTT...");
-      }
-    } 
-    else {
-      // No credentials yet — wait for base over Bluetooth
-      if (wifiCasePtr >= 3) {
-        wifiCasePtr = 1; // sit in BT / credential wait path
-      }
-      subCasePtr = 0;
-      lcdWrite("Pairing...", "BT Creds...");
-    }
+    // Pause MQTT while waiting; WiFi may stay up until new creds arrive
+    pendingMqttDisconnect = true;
+
+    subCasePtr = 0;
+    lcdWrite("Pairing...", "BT Creds...");
 
     mainCasePtr++;
   } break;
@@ -3691,13 +3715,27 @@ void loop() {
     // Phase 0: wait for WiFi credentials from base via Bluetooth
     if (subCasePtr == 0) {
       if (gotWifiCredentials && !ssid.isEmpty() && !password.isEmpty()) {
-        PrintDebug("Pairing: got BT credentials, connecting WiFi", PRINT_WIFI_DEBUG);
+        PrintDebug("Pairing: got BT credentials", PRINT_WIFI_DEBUG);
         startTimout(PAIR_TIMEOUT);
-        if (!isWifiConnected) {
+
+        bool onCorrectWifi =
+            (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid);
+
+        if (onCorrectWifi) {
+          // Same network — only refresh MQTT / broker handshake
+          gotPing = false;
+          isMqttServiceConnected = false;
+          wifiCasePtr = 5;
+          subCasePtr = 2;
+          lcdWrite("Pairing...", "MQTT...");
+        } else {
+          // New or different SSID/password, or not connected — full WiFi join
+          isWifiConnected = false;
+          isMqttServiceConnected = false;
           wifiCasePtr = 3;
+          subCasePtr = 1;
+          lcdWrite("Pairing...", "WiFi...");
         }
-        subCasePtr = 1;
-        lcdWrite("Pairing...", "WiFi...");
       }
       break;
     }
