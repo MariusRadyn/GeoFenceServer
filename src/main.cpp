@@ -85,7 +85,7 @@ char settingsIotType[32] = {0};
 char settingsIotName[32] = {0};
 char settingsUserDocId[29] = {0};
 char settingsMonDocId[29] = {0};
-int32_t settingsTicksPerMeter = 0;
+float settingsTicksPerMeter = 20.0f;
 
 int wifiCasePtr = 0;
 int mainCasePtr = 0;
@@ -273,6 +273,7 @@ int session = 0;
 bool isSessionOpen = false;
 bool isCalibrating = false;
 bool hasNewCalibrateValue = false;
+bool calibrationCompleteUiPending = false;
 
 
 // User Tags
@@ -516,6 +517,8 @@ String tagToString(byte *addr);
 void mqttSendSync();
 void mqttServiceLoop();
 void mqttProcessDeferred(); // WiFi task only — disconnect / queued publishes
+static float ticksPerMeterForDistance();
+static void applyTicksPerMeterFromJson(JsonObject json);
 String GetMacAddress();
 String readSessionNrFromFile() ;
 void writeSessionNrToFile(const char *session);
@@ -578,7 +581,7 @@ void IRAM_ATTR onTimerOneSec() {
     timeoutFlag = true;
     if(simulateWheelDistance) {
       wheelTicksCount+=11;
-      wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
+      wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
       wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
     }
     else{
@@ -1401,7 +1404,7 @@ void IotTask(void *parameter) {
     case 12:
       if (!wheelSensor2Low) {
         wheelTicksCount++;
-        wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
+        wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
         wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
         PrintDebug("Forward:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
         casePtr = 0;
@@ -1435,7 +1438,7 @@ void IotTask(void *parameter) {
           wheelTicksCount--;
         }
 
-        wheelDistance = (double)wheelTicksCount / settingsTicksPerMeter;
+        wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
         PrintDebug("Reverse:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
         casePtr = 0;
       }
@@ -2043,7 +2046,12 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     // CALIBRATE
     if (_cmd == MQTT_CMD_CALIBRATE) {
       connectedDeviceId = fromDeviceId;
+
+      const int calTicks =
+          hasNewCalibrateValue ? wheelTicksCount : 0;
+
       wheelTicksCount = 0;
+      hasNewCalibrateValue = false;
 
       // Send Confirmation MQTT
       MqttJsonDoc mqttPacket;
@@ -2054,16 +2062,18 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_CALIBRATE;
 
       JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
-      
-      if(hasNewCalibrateValue) payload[JSON_MEASURE_TICKS] = wheelTicksCount;
-      else payload[JSON_MEASURE_TICKS] = 0;
+      payload[JSON_MEASURE_TICKS] = calTicks;
 
-      hasNewCalibrateValue = false;
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+
+      if (calTicks > 0) {
+        calibrationCompleteUiPending = true;
+      }
     }
 
     // CONNECT MONITOR
     if (_cmd == MQTT_CMD_CONNECT_MONITOR) {
+      applyTicksPerMeterFromJson(_payloadJson);
       androidConnected = true;
       connectedDeviceId = fromDeviceId;
       wheelTicksCount = 0;
@@ -2101,27 +2111,26 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     if (_cmd == MQTT_CMD_FOUND_MONITOR) {
       // iotType
       const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
-      if (iotType && iotType[0])
+      if (iotType && iotType[0]) {
         strlcpy(settingsIotType, iotType, sizeof(settingsIotType));
-
-      // Ticks per Meter
-      if (!_payloadJson[JSON_SET_TICKS_PER_M].isNull()) {
-        settingsTicksPerMeter = _payloadJson[JSON_SET_TICKS_PER_M].as<int32_t>();
       }
+
+      applyTicksPerMeterFromJson(_payloadJson);
 
       // iotName
       const char *iotName = _payloadJson[JSON_IOT_NAME].as<const char *>();
-      if (iotName && iotName[0])
+      if (iotName && iotName[0]) {
         strlcpy(settingsIotName, iotName, sizeof(settingsIotName));
+      }
 
-      // Monitor Doc ID — required for a successful re-pair
+      // Monitor Doc ID — required for a full pair ack
       const char *monId = _payloadJson[JSON_MON_DOC_ID].as<const char *>();
       if (monId && monId[0]) {
         strlcpy(settingsMonDocId, monId, sizeof(settingsMonDocId));
         PrintDebug(String("FOUND_MONITOR monDocId: ") + settingsMonDocId,
                    PRINT_FLASH_DEBUG);
-      } else {
-        PrintDebug("FOUND_MONITOR missing monDocId — keeping unpaired",
+      } else if (!newSettingsRecieved) {
+        PrintDebug("FOUND_MONITOR missing monDocId and no settings to apply",
                    PRINT_ERRORS);
         return;
       }
@@ -2134,16 +2143,17 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
                    PRINT_FLASH_DEBUG);
       }
 
-      MqttJsonDoc mqttPacket;
+      if (monId && monId[0]) {
+        MqttJsonDoc mqttPacket;
 
-      mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
-      mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
-      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
-      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_FOUND_MONITOR;
+        mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+        mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
+        mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+        mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_FOUND_MONITOR;
 
-      mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
-      newSettingsRecieved = true;
-      androidPaired = true;
+        mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+        androidPaired = true;
+      }
     }
 
     // Readings Data (ACK)
@@ -2357,6 +2367,7 @@ void mqttReportLiveIotData() {
   // Payload Json
   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
   payload[MQTT_JSON_WHEEL_DISTANCE] = wheelDistance;
+  payload[JSON_MEASURE_TICKS] = wheelTicksCount;
 
   mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
@@ -2641,12 +2652,27 @@ void bt_StartAdvertising() {
 }
 
 // Read/Write Prevs (Credentials)
+static float ticksPerMeterForDistance() {
+  return settingsTicksPerMeter >= 0.1f ? settingsTicksPerMeter : 20.0f;
+}
+
+static void applyTicksPerMeterFromJson(JsonObject json) {
+  if (json[JSON_SET_TICKS_PER_M].isNull()) {
+    return;
+  }
+  settingsTicksPerMeter = json[JSON_SET_TICKS_PER_M].as<float>();
+  if (settingsTicksPerMeter < 0.1f) {
+    settingsTicksPerMeter = 20.0f;
+  }
+  newSettingsRecieved = true;
+}
+
 void saveSettingsToFlash() {
   char _iotType[32];
   char _iotName[32];
   char _uid[sizeof(settingsUserDocId)];
   char _monid[sizeof(settingsMonDocId)];
-  int _ticks = 0;
+  float _ticks = 0.0f;
 
   prefs.begin(FLASH_SETTINGS, false); // read-write
 
@@ -2654,7 +2680,10 @@ void saveSettingsToFlash() {
   prefs.getString(FLASH_SET_IOT_TYPE, _iotType, sizeof(_iotType));
   prefs.getString(FLASH_SET_MONITOR_DOC_ID, _monid, sizeof(_monid));
   prefs.getString(FLASH_SET_USER_DOC_ID, _uid, sizeof(_uid));
-  _ticks = prefs.getInt(FLASH_SET_TICKS_PER_M, 0);
+  _ticks = prefs.getFloat(FLASH_SET_TICKS_PER_M, 0.0f);
+  if (_ticks < 0.1f) {
+    _ticks = (float)prefs.getInt(FLASH_SET_TICKS_PER_M, 20);
+  }
 
   // Save New — remove first so NVS accepts a different-length string
   if (strcmp(settingsMonDocId, _monid) != 0) {
@@ -2673,8 +2702,8 @@ void saveSettingsToFlash() {
     prefs.remove(FLASH_SET_IOT_NAME);
     prefs.putString(FLASH_SET_IOT_NAME, settingsIotName);
   }
-  if (settingsTicksPerMeter != _ticks) {
-    prefs.putInt(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);
+  if (fabsf(settingsTicksPerMeter - _ticks) > 0.001f) {
+    prefs.putFloat(FLASH_SET_TICKS_PER_M, settingsTicksPerMeter);
   }
 
   prefs.end();
@@ -2696,7 +2725,13 @@ void readSettingsFromFlash() {
                   sizeof(settingsMonDocId));
   prefs.getString(FLASH_SET_USER_DOC_ID, settingsUserDocId,
                   sizeof(settingsUserDocId));
-  settingsTicksPerMeter = prefs.getInt(FLASH_SET_TICKS_PER_M, 20);
+  settingsTicksPerMeter = prefs.getFloat(FLASH_SET_TICKS_PER_M, 0.0f);
+  if (settingsTicksPerMeter < 0.1f) {
+    settingsTicksPerMeter = (float)prefs.getInt(FLASH_SET_TICKS_PER_M, 20);
+  }
+  if (settingsTicksPerMeter < 0.1f) {
+    settingsTicksPerMeter = 20.0f;
+  }
 
   PrintDebug(String("From FLASH -  ") + FLASH_SET_IOT_NAME + String(": ") +
                  settingsIotName + ", " + FLASH_SET_IOT_TYPE + String(": ") +
@@ -2754,7 +2789,7 @@ void deleteSettingsFromFlash() {
   settingsIotName[0] = '\0';
   settingsUserDocId[0] = '\0';
   settingsMonDocId[0] = '\0';
-  settingsTicksPerMeter = 0;
+  settingsTicksPerMeter = 20.0f;
   androidPaired = false;
 
   PrintDebug("Settings deleted", PRINT_FLASH_DEBUG);
@@ -3347,6 +3382,15 @@ void loop() {
     lcdReinit();
     lcd_i2c.backlight();
     mainCasePtr = CASE_HOME; // redraw Ready / No Session
+  }
+
+  if (calibrationCompleteUiPending) {
+    calibrationCompleteUiPending = false;
+    isCalibrating = false;
+    lcdWrite("CALIBRATED", "");
+    buzzerOn(1, 200, 0);
+    startTimout(DISPLAY_TIMEOUT);
+    mainCasePtr = CASE_DISPLAY_RETURN_HOME;
   }
 
   // Soft battery alarm — show message, then return to previous screen
@@ -4470,6 +4514,7 @@ case 35:{
     isRunningLive = true;
     oldDistance = 0;
     wheelDistance = 0;
+    wheelTicksCount = 0;
     mainCasePtr++;
   } break;
 
