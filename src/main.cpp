@@ -98,7 +98,7 @@ bool isRPiConnected = false;
 bool gotWifiCredentials = false;
 bool gotPing = false;
 bool gotSync = false;
-int wheelTicksCount = 0;
+volatile int wheelTicksCount = 0;
 
 // Commands
 const String CMD_SHARED_WIFI_CREDENTIALS =
@@ -128,7 +128,7 @@ volatile bool debWheel1RiseEdge = false;
 volatile bool debWheel1High = false;
 volatile bool debWheel1Low = false;
 volatile int debWheel1LastTime = 0;
-bool wheelSensor1Low = false;
+volatile bool wheelSensor1Low = false;
 
 // Wheel 2 sensor Debounce
 volatile bool debWheel2FallEdge = false;
@@ -136,15 +136,20 @@ volatile bool debWheel2RiseEdge = false;
 volatile bool debWheel2High = false;
 volatile bool debWheel2Low = false;
 volatile int debWheel2LastTime = 0;
-bool wheelSensor2Low = false;
+volatile bool wheelSensor2Low = false;
 
-// MQTT Command
+// Wheel pulse FSM — polled with debounce (ISR bounce was counting 100+ per pulse)
+static volatile bool wheelFsmReset = false;
+static int wheelCasePtr = 0;
+
+static void resetWheelPulseState();
 constexpr size_t JSON_MAX_CMD = 32; // MAX Len
 const String MQTT_CMD_DISCOVER = "#DISCOVER";
 const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
 const String MQTT_CMD_CONNECT_MONITOR = "#CONNECT_MONITOR";
 const String MQTT_CMD_DISCONNECT_MONITOR = "#DISCONNECT_MONITOR";
 const String MQTT_CMD_CALIBRATE = "#CALIBRATE";
+const String MQTT_CMD_SYNC_SETTINGS = "#SYNC_SETTINGS";
 const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
 const String MQTT_CMD_ACK = "#ACK";
 const String MQTT_CMD_PING = "#PING";
@@ -271,9 +276,10 @@ int iotDataCount = 0;
 int8_t iotDataIndex = 0;
 int session = 0;
 bool isSessionOpen = false;
-bool isCalibrating = false;
+volatile bool isCalibrating = false;
 bool hasNewCalibrateValue = false;
 bool calibrationCompleteUiPending = false;
+bool syncSettingsUiPending = false;
 
 
 // User Tags
@@ -378,6 +384,9 @@ bool isPushingIotData = false;
 bool isPushingIotDataTimeout = false;
 double wheelDistance = 0;
 double oldDistance = 0;
+int oldWheelTicksCount = 0;
+int lastLiveMqttTicks = 0;
+double lastLiveMqttDistance = 0;
 char nrOfLanesToCut[3];
 uint8_t laneIndex = 0;
 
@@ -400,7 +409,7 @@ bool calibrationMode = false;
 bool androidPaired = false;
 bool newSettingsRecieved = false;
 bool dataACK = false;
-bool isRunningLive = false;
+volatile bool isRunningLive = false;
 bool iotTypeError = false;
 bool getFirstBatReading = true;
 bool newBatReadingAvailable = false;
@@ -444,7 +453,7 @@ const bool PRINT_FLASH_DEBUG = true;
 const bool PRINT_CREDENTIALS_DEBUG = true;
 const bool PRINT_WIFI_DEBUG = true;
 const bool PRINT_BT_DEBUG = true;
-const bool PRINT_DEBOUNCE_DEBUG = true;
+const bool PRINT_DEBOUNCE_DEBUG = false; // true floods Serial and misses wheel edges
 const bool SIMULATE_WHEEL_DISTANCE = false; // debug: fake ticks while measuring
 const bool SHOW_ADC_COUNT = false; // debug: fake ticks while measuring
 
@@ -474,7 +483,7 @@ void bt_NotifyStatus(const String &status);
 void applyBatteryPowerSave();
 void clearBatteryPowerSave();
 void lcdReinit();
-void mqttTX(const JsonDocument &msg, const String &topic);
+bool mqttTX(const JsonDocument &msg, const String &topic);
 void mqttRx(char *topic, byte *payload, unsigned int length);
 void PrintDebug(String, bool);
 void lcdWrite(const char *line1, const char *line2);
@@ -506,7 +515,7 @@ void loadDistancesFromNVM(std::vector<int> &nums);
 bool readReadingsFromFlash(const char *key, IotData_Wheel &out);
 void mqttReportMyID();
 void mqttReportTag();
-void mqttReportLiveIotData();
+bool mqttReportLiveIotData();
 void mqttSendDisconnectMonitor();
 void requestLiveDisconnect(const char *reason);
 void mqttPushIotData(int);
@@ -600,13 +609,9 @@ void startTimout(int seconds) {
   timerAlarmEnable(timer);
 }
 
-// Interrupts
-void IRAM_ATTR wheelSensor1ISR() { 
-  debWheel1FallEdge = true; 
-}
-void IRAM_ATTR wheelSensor2ISR() { 
-  debWheel2FallEdge = true; 
-}
+// Interrupts — edge flags only; counting is debounced in IotTask
+void IRAM_ATTR wheelSensor1ISR() { debWheel1FallEdge = true; }
+void IRAM_ATTR wheelSensor2ISR() { debWheel2FallEdge = true; }
 
 // Tasks
 void GeneralTask(void *parameter) {
@@ -1346,7 +1351,6 @@ void wifiConnectTask(void *parameter) {
 void IotTask(void *parameter) {
   bool printed = false;
   bool showStack = true;
-  int casePtr = 0;
 
   for (;;) {
     if (!printed) {
@@ -1354,13 +1358,16 @@ void IotTask(void *parameter) {
       printed = true;
     }
 
+    // Keep 1 ms cadence — vTaskDelay(0) at higher priority starves buzzer/LCD
     vTaskDelay(1 / portTICK_PERIOD_MS);
 
-    // Distance Wheel
-    // if (strcmp((const char *)settingsIotType, IOT_TYPE_WHEEL) == 0)
-    //{
     DebounceWheelSensor1();
     DebounceWheelSensor2();
+
+    if (wheelFsmReset) {
+      wheelFsmReset = false;
+      wheelCasePtr = 0;
+    }
 
     if (showStack) {
       showStack = false;
@@ -1368,37 +1375,32 @@ void IotTask(void *parameter) {
                     uxTaskGetStackHighWaterMark(IotTaskHandle));
     }
 
-    // Get Wheel Distance
-    switch (casePtr) {
+    switch (wheelCasePtr) {
     case 0: {
       // Forward
       if (wheelSensor1Low)
-        casePtr = 10;
+        wheelCasePtr = 10;
 
-      // Reverse
-      if (wheelSensor2Low)
-        casePtr = 20;
+      // Reverse (ignored during cal/live)
+      if (wheelSensor2Low && !isCalibrating && !isRunningLive)
+        wheelCasePtr = 20;
     } break;
 
     // Forward
     case 10: {
-      // Forward
       if (!wheelSensor1Low)
-        casePtr++;
+        wheelCasePtr++;
 
-      // Reverse
       if (wheelSensor2Low)
-        casePtr = 0;
+        wheelCasePtr = 0;
     } break;
 
     case 11: {
-      // Forward
       if (!wheelSensor2Low)
-        casePtr++;
+        wheelCasePtr++;
 
-      // Reverse
       if (wheelSensor1Low)
-        casePtr = 0;
+        wheelCasePtr = 0;
     } break;
 
     case 12:
@@ -1406,53 +1408,58 @@ void IotTask(void *parameter) {
         wheelTicksCount++;
         wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
         wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
-        PrintDebug("Forward:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
-        casePtr = 0;
+        wheelCasePtr = 0;
       }
       break;
 
     // Reverse
     case 20: {
-      // Reverse
       if (!wheelSensor2Low)
-        casePtr++;
+        wheelCasePtr++;
 
-      // Forward
       if (wheelSensor1Low)
-        casePtr = 0;
+        wheelCasePtr = 0;
     } break;
 
     case 21: {
-      // Reverse
       if (wheelSensor1Low)
-        casePtr++;
+        wheelCasePtr++;
 
-      // Forward
       if (wheelSensor2Low)
-        casePtr = 0;
+        wheelCasePtr = 0;
     } break;
 
     case 22: {
       if (!wheelSensor1Low) {
-        if (wheelTicksCount > 0) {
+        // Cal / live: forward-only — reverse bounce must not shrink distance
+        if (wheelTicksCount > 0 && !isCalibrating && !isRunningLive) {
           wheelTicksCount--;
         }
 
         wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
-        PrintDebug("Reverse:" + String(wheelDistance), PRINT_GENERAL_DEBUG);
-        casePtr = 0;
+        wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
+        wheelCasePtr = 0;
       }
     } break;
 
     default:
-      casePtr = 0;
+      wheelCasePtr = 0;
       break;
     }
-    //}
   }
 }
 
-// Debounce
+static void resetWheelPulseState() {
+  wheelCasePtr = 0;
+  debWheel1LastTime = 0;
+  debWheel2LastTime = 0;
+  debWheel1Low = (digitalRead(SENSOR_WHEEL_1) == LOW);
+  debWheel2Low = (digitalRead(SENSOR_WHEEL_2) == LOW);
+  wheelSensor1Low = debWheel1Low;
+  wheelSensor2Low = debWheel2Low;
+  wheelFsmReset = true;
+}
+
 void DebouncePairBtn() {
   // if (debPairFallEdge)
   // {
@@ -1514,83 +1521,36 @@ void DebouncePairBtn() {
   // }
 }
 void DebounceWheelSensor1() {
-  // if (debWheel1FallEdge)
-  // {
-  //   debWheel1LastTime = millis();
-  //   debWheel1FallEdge = false;
-  // }
-
   if (!debWheel1Low) {
-    // if (debWheel1LastTime > 0)
-    //{
     if (digitalRead(SENSOR_WHEEL_1)) {
-      // debWheel1LastTime = 0;
       return;
     }
-
-    // Sensor Falling Edge
-    // uint32_t currentTime = millis();
-    // if (currentTime - debWheel1LastTime > WHEEL_DEBOUNCE_DELAY)
-    //{
     debWheel1Low = true;
     wheelSensor1Low = true;
     PrintDebug("Sensor1 Low", PRINT_DEBOUNCE_DEBUG);
-    //}
-    //}
   } else {
-    // Sensor Low
-    // uint32_t currentTime = millis();
-    // if (currentTime - debWheel1LastTime > WHEEL_DEBOUNCE_DELAY)
-    //{
-    // Sensor Rising Edge
     if (digitalRead(SENSOR_WHEEL_1) == HIGH) {
       debWheel1Low = false;
-      // debWheel1LastTime = 0;
       wheelSensor1Low = false;
       PrintDebug("Sensor1 Hi", PRINT_DEBOUNCE_DEBUG);
     }
-    //}
   }
 }
 void DebounceWheelSensor2() {
-  // if (debWheel2FallEdge)
-  // {
-  //   debWheel2LastTime = millis();
-  //   debWheel2FallEdge = false;
-  // }
-
   if (!debWheel2Low) {
-    // if (debWheel2LastTime > 0)
-    // {
-    //   // High
     if (digitalRead(SENSOR_WHEEL_2)) {
-      // debWheel2LastTime = 0;
       return;
     }
-
-    //   // Falling Edge
-    //   uint32_t currentTime = millis();
-    //   if (currentTime - debWheel2LastTime > WHEEL_DEBOUNCE_DELAY)
-    //   {
     debWheel2Low = true;
     wheelSensor2Low = true;
     PrintDebug("Sensor2 Low", PRINT_DEBOUNCE_DEBUG);
-    //   }
-    // }
   } else {
-    // Low
-
-    // uint32_t currentTime = millis();
-    // if (currentTime - debWheel2LastTime > WHEEL_DEBOUNCE_DELAY)
-    // {
-    //   // Rising Edge
     if (digitalRead(SENSOR_WHEEL_2) == HIGH) {
       debWheel2Low = false;
       debWheel2LastTime = 0;
       wheelSensor2Low = false;
       PrintDebug("Sensor2 Hi", PRINT_DEBOUNCE_DEBUG);
     }
-    // }
   }
 }
 
@@ -2077,6 +2037,9 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       androidConnected = true;
       connectedDeviceId = fromDeviceId;
       wheelTicksCount = 0;
+      lastLiveMqttTicks = 0;
+      lastLiveMqttDistance = 0;
+      resetWheelPulseState();
 
       // Send Confirmation MQTT
       MqttJsonDoc mqttPacket;
@@ -2105,6 +2068,36 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_DISCONNECT_MONITOR;
 
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+    }
+
+    // SYNC SETTINGS (ticks/m from app Sync button — ack back to app)
+    if (_cmd == MQTT_CMD_SYNC_SETTINGS) {
+      const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
+      if (iotType && iotType[0]) {
+        strlcpy(settingsIotType, iotType, sizeof(settingsIotType));
+        newSettingsRecieved = true;
+      }
+
+      applyTicksPerMeterFromJson(_payloadJson);
+      syncSettingsUiPending = true;
+
+      MqttJsonDoc mqttPacket;
+      mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+      mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
+      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_SYNC_SETTINGS;
+
+      JsonObject replyPayload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
+      replyPayload[JSON_SET_TICKS_PER_M] = settingsTicksPerMeter;
+      if (settingsIotType[0]) {
+        replyPayload[JSON_IOT_TYPE] = settingsIotType;
+      }
+
+      mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+      PrintDebug(
+          String("SYNC_SETTINGS applied ticksPerM=") +
+              String(settingsTicksPerMeter, 2),
+          PRINT_FLASH_DEBUG);
     }
 
     // FOUND MONITOR (Pair Done) (Save Settings to FLASH)
@@ -2215,15 +2208,15 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
     }
   }
 }
-void mqttTX(const JsonDocument &msg, const String &topic) {
+bool mqttTX(const JsonDocument &msg, const String &topic) {
   if (!isWifiConnected) {
     Serial.println("WiFi not connected");
-    return;
+    return false;
   }
 
   if (!mqttServer.connected()) {
     Serial.println("MQTT not connected");
-    return;
+    return false;
   }
 
   size_t payloadSize = measureJson(msg);
@@ -2231,7 +2224,7 @@ void mqttTX(const JsonDocument &msg, const String &topic) {
 
   if (payloadSize >= sizeof(payload)) {
     Serial.printf("MQTT payload too large %i>%i", payloadSize, sizeof(payload));
-    return;
+    return false;
   }
 
   size_t len = serializeJson(msg, payload);
@@ -2247,6 +2240,7 @@ void mqttTX(const JsonDocument &msg, const String &topic) {
   } else {
     Serial.println("MQTT publish failed");
   }
+  return ok;
 }
 void mqttSendPing() {
   gotPing = false;
@@ -2313,9 +2307,16 @@ void mqttProcessDeferred() {
     pendingMqttReportTag = false;
     mqttReportTag();
   }
-  if (pendingMqttReportLive) {
-    pendingMqttReportLive = false;
-    mqttReportLiveIotData();
+  if (pendingMqttReportLive ||
+      wheelTicksCount != lastLiveMqttTicks ||
+      wheelDistance != lastLiveMqttDistance) {
+    if (mqttReportLiveIotData()) {
+      lastLiveMqttTicks = wheelTicksCount;
+      lastLiveMqttDistance = wheelDistance;
+      pendingMqttReportLive =
+          (wheelTicksCount != lastLiveMqttTicks ||
+           wheelDistance != lastLiveMqttDistance);
+    }
   }
   if (pendingMqttDisconnectMonitor) {
     pendingMqttDisconnectMonitor = false;
@@ -2342,6 +2343,10 @@ void mqttSendDisconnectMonitor() {
 }
 
 void requestLiveDisconnect(const char *reason) {
+  if (wheelTicksCount != lastLiveMqttTicks ||
+      wheelDistance != lastLiveMqttDistance) {
+    pendingMqttReportLive = true;
+  }
   isRunningLive = false;
   androidConnected = false;
   pendingMqttDisconnectMonitor = true;
@@ -2356,7 +2361,7 @@ void requestLiveDisconnect(const char *reason) {
   mainCasePtr = CASE_HOME;
   PrintDebug(String("Live disconnect: ") + reason, PRINT_GENERAL_DEBUG);
 }
-void mqttReportLiveIotData() {
+bool mqttReportLiveIotData() {
   MqttJsonDoc mqttPacket;
 
   mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -2364,12 +2369,12 @@ void mqttReportLiveIotData() {
   mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
   mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_LIVE_MONITOR_DATA;
 
-  // Payload Json
+  // Payload Json — always send latest counter values
   JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
   payload[MQTT_JSON_WHEEL_DISTANCE] = wheelDistance;
   payload[JSON_MEASURE_TICKS] = wheelTicksCount;
 
-  mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+  return mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
 }
 void mqttReportTag() {
   MqttJsonDoc mqttPacket;
@@ -2850,6 +2855,9 @@ void factoryReset() {
   wheelTicksCount = 0;
   wheelDistance = 0;
   oldDistance = 0;
+  oldWheelTicksCount = 0;
+  lastLiveMqttTicks = 0;
+  lastLiveMqttDistance = 0;
   memset(&currentIotDataWheel, 0, sizeof(currentIotDataWheel));
   memset(lastTagCode, 0, sizeof(lastTagCode));
   tagPresented = false;
@@ -3316,11 +3324,9 @@ void setup() {
   timerAlarmWrite(timer, 1000000, true);
   timerAlarmDisable(timer);
 
-  // Wheel Sensor 1 Interrupt
+  // Wheel sensor ISRs unused for counting (debounce + poll in IotTask)
   attachInterrupt(digitalPinToInterrupt(SENSOR_WHEEL_1), wheelSensor1ISR,
                   FALLING);
-
-  // Wheel Sensor 2 Interrupt
   attachInterrupt(digitalPinToInterrupt(SENSOR_WHEEL_2), wheelSensor2ISR,
                   FALLING);
 
@@ -3347,9 +3353,9 @@ void setup() {
     "IotTask",      // Task name
     7000,           // Stack size (bytes)
     NULL,           // Parameters
-    1,              // Priority
+    1,              // Priority (same as GeneralTask — do not starve buzzer/LCD)
     &IotTaskHandle, // Task handle
-    0               // Core 1
+    1               // Core 1 — keep off WiFi core 0
   );
 
   // vTaskResume(GeneralTaskHandle);
@@ -3387,7 +3393,19 @@ void loop() {
   if (calibrationCompleteUiPending) {
     calibrationCompleteUiPending = false;
     isCalibrating = false;
-    lcdWrite("CALIBRATED", "");
+    lcdWrite("Calibrated", "");
+    buzzerOn(1, 200, 0);
+    startTimout(DISPLAY_TIMEOUT);
+    mainCasePtr = CASE_DISPLAY_RETURN_HOME;
+  }
+
+  if (syncSettingsUiPending) {
+    syncSettingsUiPending = false;
+    if (newSettingsRecieved) {
+      newSettingsRecieved = false;
+      saveSettingsToFlash();
+    }
+    lcdWrite("New Settings", "");
     buzzerOn(1, 200, 0);
     startTimout(DISPLAY_TIMEOUT);
     mainCasePtr = CASE_DISPLAY_RETURN_HOME;
@@ -3486,6 +3504,7 @@ void loop() {
 
     oldDistance = 0;
     wheelDistance = 0;
+    oldWheelTicksCount = 0;
     isRunningLive = false;
     startKeyPressed = false;
     stopKeyPressed = false;
@@ -3735,7 +3754,7 @@ void loop() {
       PrintDebug("User Cancelled Pairing", PRINT_GENERAL_DEBUG);
       lcdWrite("Cancelled", "");
       startTimout(DISPLAY_TIMEOUT);
-      mainCasePtr++;
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
       break;
     }
 
@@ -3752,7 +3771,7 @@ void loop() {
       lcdWrite("Timeout", "");
       startTimout(DISPLAY_TIMEOUT);
       buzzerOn(1, 2000, 0);
-      mainCasePtr++;
+      mainCasePtr = CASE_DISPLAY_RETURN_HOME;
       break;
     }
 
@@ -3828,32 +3847,11 @@ void loop() {
         lcdWrite("Connected!", "");
         buzzerOn(4, 100, 50);
         startTimout(DISPLAY_TIMEOUT);
-        mainCasePtr++;
+        mainCasePtr = CASE_DISPLAY_RETURN_HOME;
       }
       break;
     } 
   } break;
-
-  // Rebooting (Message)
-  case 12: {
-    if (timeoutFlag) {
-      timeoutFlag = false;
-      PrintDebug("Rebooting...", PRINT_GENERAL_DEBUG);
-      lcdWrite("Rebooting...", "");
-      startTimout(DISPLAY_TIMEOUT);
-      mainCasePtr++;
-    }
-  } break;
-
-  // Message Delay
-  case 13: {
-    if (timeoutFlag) {
-      timeoutFlag = false;
-      ESP.restart();
-    }
-  } break;
-
-  // (Wheel) Start ----------------------------------------
 
   // (Wheel) Start - Present Tag
   case 20: {
@@ -4416,6 +4414,8 @@ case 35:{
       oldDistance = 0;
       wheelDistance = 0;
       wheelTicksCount = 0;
+      oldWheelTicksCount = 0;
+      resetWheelPulseState();
       mainCasePtr++;
     }
   } break;
@@ -4438,8 +4438,9 @@ case 35:{
       mainCasePtr++;
     }
 
-    // Wheel Moved
-    if (oldDistance != wheelDistance) {
+    // Wheel Moved — report on every tick, not only when rounded distance changes
+    if (wheelTicksCount != oldWheelTicksCount) {
+      oldWheelTicksCount = wheelTicksCount;
       oldDistance = wheelDistance;
       lcdWrite("Ticks: " + String(wheelTicksCount), "(Back,Stop)", false);
     }
@@ -4508,13 +4509,22 @@ case 35:{
   // Live Monitor -----------------------------------
 
   case 70: {
-    lcdWrite("Distance: " + String(wheelDistance) + "m", "Live");
-    buzzerOn(2, 100, 100);
+    if (newSettingsRecieved) {
+      newSettingsRecieved = false;
+      saveSettingsToFlash();
+    }
 
-    isRunningLive = true;
     oldDistance = 0;
     wheelDistance = 0;
     wheelTicksCount = 0;
+    oldWheelTicksCount = 0;
+    lastLiveMqttTicks = 0;
+    lastLiveMqttDistance = 0;
+    resetWheelPulseState();
+    isRunningLive = true;
+
+    lcdWrite("0.00m T:0", "Live");
+    buzzerOn(2, 100, 100);
     mainCasePtr++;
   } break;
 
@@ -4527,15 +4537,27 @@ case 35:{
       break;
     }
 
-    // Wheel Moved
-    if (oldDistance != wheelDistance) {
+    // LCD refresh on every tick — show ticks so cal vs live is comparable
+    if (wheelTicksCount != oldWheelTicksCount ||
+        oldDistance != wheelDistance) {
+      oldWheelTicksCount = wheelTicksCount;
       oldDistance = wheelDistance;
-      lcdWrite("Distance: " + String(wheelDistance) + "m", "Live", false);
+      lcdWrite("D:" + String(wheelDistance) + "m T:" + String(wheelTicksCount),
+               "Live", false);
+    }
+
+    // MQTT: queue until publish succeeds; always sends latest tick count
+    if (wheelTicksCount != lastLiveMqttTicks ||
+        wheelDistance != lastLiveMqttDistance) {
       pendingMqttReportLive = true;
     }
 
-    // Android Disconnected
+    // Android Disconnected — flush final reading then leave live mode
     if (!androidConnected) {
+      if (wheelTicksCount != lastLiveMqttTicks ||
+          wheelDistance != lastLiveMqttDistance) {
+        pendingMqttReportLive = true;
+      }
       isRunningLive = false;
       buzzerOn(1, 200, 100);
       mainCasePtr = CASE_HOME;
