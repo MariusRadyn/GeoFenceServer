@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,7 @@ const int port = 8080;
 #define WHEEL_DEBOUNCE_DELAY 10
 #define BUTTON_DEBOUNCE_DELAY 100
 #define DEBOUNCE_DELAY_HELD 3000
+#define DISTANCE_RESET_HOLD_MS 3000
 #define MS_DELAY 10
 
 #define CASE_PAIR 10
@@ -90,6 +92,7 @@ float settingsTicksPerMeter = 20.0f;
 int wifiCasePtr = 0;
 int mainCasePtr = 0;
 int subCasePtr = 0;
+unsigned long wifiConnectStartedMs = 0;
 bool isBluetoothConnected = false;
 bool isWifiConnected = false;
 bool isMqttServiceConnected = false;
@@ -99,6 +102,9 @@ bool gotWifiCredentials = false;
 bool gotPing = false;
 bool gotSync = false;
 volatile int wheelTicksCount = 0;
+volatile int wheelTicksForward = 0;  // completed forward sequences
+volatile int wheelTicksReverse = 0;  // completed reverse sequences (also -- count)
+volatile bool pendingWheelLcdActivity = false;
 
 // Commands
 const String CMD_SHARED_WIFI_CREDENTIALS =
@@ -138,9 +144,10 @@ volatile bool debWheel2Low = false;
 volatile int debWheel2LastTime = 0;
 volatile bool wheelSensor2Low = false;
 
-// Wheel pulse FSM — polled with debounce (ISR bounce was counting 100+ per pulse)
+// Wheel pulse FSM — polled (same sequence that was counting before quad rewrite)
 static volatile bool wheelFsmReset = false;
 static int wheelCasePtr = 0;
+#define LCD_TICK_REFRESH_EVERY 10 // rewrite LCD every N ticks (I2C is slow)
 
 static void resetWheelPulseState();
 constexpr size_t JSON_MAX_CMD = 32; // MAX Len
@@ -148,6 +155,7 @@ const String MQTT_CMD_DISCOVER = "#DISCOVER";
 const String MQTT_CMD_FOUND_MONITOR = "#FOUND_MONITOR";
 const String MQTT_CMD_CONNECT_MONITOR = "#CONNECT_MONITOR";
 const String MQTT_CMD_DISCONNECT_MONITOR = "#DISCONNECT_MONITOR";
+const String MQTT_CMD_UNPAIR_MONITOR = "#UNPAIR_MONITOR";
 const String MQTT_CMD_CALIBRATE = "#CALIBRATE";
 const String MQTT_CMD_SYNC_SETTINGS = "#SYNC_SETTINGS";
 const String MQTT_CMD_DEVICE_ID = "#DEVICE_ID";
@@ -299,6 +307,12 @@ bool tagCRCError = false;
 User users[MAX_USERS];
 uint16_t userCount = 0;
 bool maxUsersReached = false;
+static bool notPairedWarnBeeped = false;
+static bool noTagsWarnBeeped = false;
+
+static bool hasOperatorTags() { return userCount > 0; }
+// Paired once base assigned a monitor doc id (saved in settings flash)
+static bool isUnitPaired() { return settingsMonDocId[0] != '\0'; }
 
 // LCD
 LiquidCrystal_I2C lcd_i2c(0x27, 16,
@@ -361,10 +375,40 @@ uint8_t factoryResetPinIndex = 0;
 TaskHandle_t GeneralTaskHandle = NULL;
 TaskHandle_t ConnectWiFiTaskHandle = NULL;
 TaskHandle_t IotTaskHandle = NULL;
+// ESP32 Arduino: stack sizes are bytes. Leave headroom — HWM "free" should stay
+// well above ~512 or the next String/JSON/I2C spike can overflow.
+#define STACK_GENERAL_TASK 5120  // keypad + OneWire + String (was 3000 — tight)
+#define STACK_WIFI_TASK    12288 // MQTT RX + StaticJsonDoc + mqttTX[512]
+#define STACK_IOT_TASK     4096  // lean wheel FSM only
+#define STACK_HWM_WARN_BYTES 512
+
+static void reportTaskStacks(const char *when) {
+  auto hwm = [](TaskHandle_t h) -> UBaseType_t {
+    return h ? uxTaskGetStackHighWaterMark(h) : 0;
+  };
+  const UBaseType_t gen = hwm(GeneralTaskHandle);
+  const UBaseType_t wifi = hwm(ConnectWiFiTaskHandle);
+  const UBaseType_t iot = hwm(IotTaskHandle);
+  const UBaseType_t loopHwm = uxTaskGetStackHighWaterMark(NULL); // caller task
+  Serial.printf(
+      "Stack HWM free (%s): General=%u/%u WiFi=%u/%u Iot=%u/%u this=%u\n",
+      when, (unsigned)gen, STACK_GENERAL_TASK, (unsigned)wifi, STACK_WIFI_TASK,
+      (unsigned)iot, STACK_IOT_TASK, (unsigned)loopHwm);
+  if (gen && gen < STACK_HWM_WARN_BYTES) {
+    Serial.println("WARN: GeneralTask stack nearly exhausted");
+  }
+  if (wifi && wifi < STACK_HWM_WARN_BYTES) {
+    Serial.println("WARN: ConnectWiFiTask stack nearly exhausted");
+  }
+  if (iot && iot < STACK_HWM_WARN_BYTES) {
+    Serial.println("WARN: IotTask stack nearly exhausted");
+  }
+}
 
 // Bluetooth
 #define PAIR_TIMEOUT 60   // seconds (BT creds + WiFi + MQTT + discover)
 #define DISPLAY_TIMEOUT 2 // seconds
+#define LCD_IDLE_BACKLIGHT_MS (5UL * 60UL * 1000UL) // dim after 5 min idle
 #define SERVICE_UUID "f3a1c2d0-6b4e-4e9a-9f3e-8d2f1c9b7a1e"
 #define CHAR_UUID "c7b2e3f4-1a5d-4c3b-8e2f-9a6b1d8c2f3a"
 const String NAME_PREFIX = "iOT_"; // Bluetooth Prefix
@@ -382,6 +426,8 @@ String toDeviceId;
 bool newIotDataPushed = false;
 bool isPushingIotData = false;
 bool isPushingIotDataTimeout = false;
+volatile bool pendingIotDataPush = false; // set on MQTT reconnect; run after operators sync
+unsigned long iotDataPushAfterMs = 0;
 double wheelDistance = 0;
 double oldDistance = 0;
 int oldWheelTicksCount = 0;
@@ -397,6 +443,8 @@ bool backKeyPressed = false;
 bool openKeyPressed = false;
 bool closeKeyPressed = false;
 bool newNumKeyPressed = false;
+unsigned long lastKeyHeldMs = 0;
+volatile bool pendingDistanceReset = false;
 bool startPairing = false;
 bool startFactoryReset = false;
 bool btConnected = false;
@@ -404,6 +452,8 @@ bool btConnected = false;
 bool isPairing = false;
 bool clearWifiCredsOnPairFail = false; // wipe WiFi only on first-pair cancel/timeout
 bool btWifiOkNotified = false;
+unsigned long lastPairingNotifyMs = 0;
+#define PAIRING_NOTIFY_RETRY_MS 2000UL
 bool androidConnected = false;
 bool calibrationMode = false;
 bool androidPaired = false;
@@ -422,6 +472,9 @@ bool showMqttWarning = true;
 volatile bool pendingOperatorsUpdate = false;
 bool newOperatorsRecieved = false;
 bool wakeBacklight = false;
+volatile unsigned long lcdActivityMs = 0;
+volatile bool lcdBacklightIsOn = true;
+volatile bool pendingLcdBacklightOn = false;
 
 // Battery
 #define BAT_MAX_COUNT 3650
@@ -458,7 +511,7 @@ const bool SIMULATE_WHEEL_DISTANCE = false; // debug: fake ticks while measuring
 const bool SHOW_ADC_COUNT = false; // debug: fake ticks while measuring
 
 bool simulateWheelDistance = false;       // runtime — armed each measure start
-bool skipResetPin = true;
+bool skipResetPin = false; // true = debug only; production must ask for PIN
 
 
 // LittleFS Filenames
@@ -489,6 +542,7 @@ void PrintDebug(String, bool);
 void lcdWrite(const char *line1, const char *line2);
 void lcdWrite(const char *line1, const char *line2, bool showMeasureCnt);
 void lcdRefresh();
+static void noteLcdActivity();
 bool getKeypad(char *out, size_t outSize);
 void keypadInit();
 void saveDistancesToNVM(int value);
@@ -528,6 +582,7 @@ void mqttServiceLoop();
 void mqttProcessDeferred(); // WiFi task only — disconnect / queued publishes
 static float ticksPerMeterForDistance();
 static void applyTicksPerMeterFromJson(JsonObject json);
+static void syncWheelDistanceFromTicks();
 String GetMacAddress();
 String readSessionNrFromFile() ;
 void writeSessionNrToFile(const char *session);
@@ -758,18 +813,20 @@ void GeneralTask(void *parameter) {
 
       if (showStack) {
         showStack = false;
-        Serial.printf("%s Stack free: %u bytes\n", pcTaskGetName(NULL),
-                      uxTaskGetStackHighWaterMark(GeneralTaskHandle));
+        reportTaskStacks("GeneralTask first key");
       }
 
       PrintDebug(String("Key Pressed: ") + key, PRINT_GENERAL_DEBUG);
+
+      noteLcdActivity();
 
       // Wake Backlight (Battery Low)
       if(batteryLow){
         wakeBacklight = true;
       }
 
-      // Live monitor: any key drops the session and tells the app
+      // Live monitor: any reported key disconnects (STOP hold-zero is handled
+      // inside getKeypad at the 3s mark and does not return a key)
       if (isRunningLive) {
         requestLiveDisconnect("key");
         continue;
@@ -866,7 +923,7 @@ void GeneralTask(void *parameter) {
         if (OneWire::crc8(tagCode, 7) != tagCode[7]) {
           tagCRCError = true;
           PrintDebug("CRC ERROR", PRINT_GENERAL_DEBUG);
-          return;
+          continue;
         }
 
         // Verify
@@ -1055,11 +1112,24 @@ void wifiConnectTask(void *parameter) {
        // Start WiFi Connection (re-pair may land here after BT updated ssid/pw)
       PrintDebug("Connecting to Wifi ... ", PRINT_WIFI_DEBUG);
       PrintDebug("SSID: " + ssid, PRINT_WIFI_DEBUG);
+      isWifiConnected = false;
+      isMqttServiceConnected = false;
+      if (ssid.isEmpty() || password.isEmpty()) {
+        readWifiCredFromFlash();
+      }
+      if (ssid.isEmpty() || password.isEmpty()) {
+        PrintDebug("No WiFi creds — wait for BT", PRINT_WIFI_DEBUG);
+        wifiCasePtr = 1;
+        startTimout(30);
+        break;
+      }
       if (WiFi.status() == WL_CONNECTED) {
         WiFi.disconnect(false);
         vTaskDelay(100 / portTICK_PERIOD_MS);
       }
+      WiFi.mode(WIFI_STA);
       WiFi.begin(ssid, password);
+      wifiConnectStartedMs = millis();
       wifiCasePtr++;
     } break;
 
@@ -1073,6 +1143,13 @@ void wifiConnectTask(void *parameter) {
 
         isWifiConnected = true;
         digitalWrite(LED_WIFI_CONNECTED, HIGH); // Red
+        wifiConnectStartedMs = 0;
+
+        // WiFi.begin() often kills NimBLE advertising — restart so the base
+        // can reconnect BLE (blue LED) after coming back in range.
+        if (pServer != nullptr && pServer->getConnectedCount() == 0) {
+          bt_StartAdvertising();
+        }
 
         // Stale flash broker IP after hotspot subnet change (e.g. 10.35.x vs 10.134.x)
         if (serverIP[0] != '\0' && !mqttBrokerOnLocalSubnet()) {
@@ -1095,6 +1172,15 @@ void wifiConnectTask(void *parameter) {
 
         setTime();
         wifiCasePtr++;
+      } else {
+        // Still associating — retry begin if stalled (e.g. back from out of range)
+        if (wifiConnectStartedMs == 0) {
+          wifiConnectStartedMs = millis();
+        } else if ((millis() - wifiConnectStartedMs) > 20000UL) {
+          PrintDebug("WiFi connect timeout — retry", PRINT_WIFI_DEBUG);
+          wifiCasePtr = 3;
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
       }
     } break;
 
@@ -1104,8 +1190,15 @@ void wifiConnectTask(void *parameter) {
         wifiCasePtr = 15;
         break;
       }
+      if (WiFi.status() != WL_CONNECTED) {
+        isWifiConnected = false;
+        isMqttServiceConnected = false;
+        wifiCasePtr = 3;
+        break;
+      }
 
       mqttServer.setBufferSize(MQTT_RX_BUFFER_SIZE);
+      mqttServer.setCallback(mqttRx);
 
       // Re-pair / forced handshake: drop stale broker session so DEVICE_ID +
       // subscribe + PING actually run (connect() is a no-op if already up).
@@ -1146,8 +1239,15 @@ void wifiConnectTask(void *parameter) {
           (String("MQTT Subscribe ...") + MQTT_TOPIC_TO_IOT_PRIVATE.c_str()),
           PRINT_WIFI_DEBUG);
 
+      // Brief pump so SUBACK is processed before first #PING
+      for (int i = 0; i < 10; i++) {
+        mqttServiceLoop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
       Serial.printf("%s Stack free: %u bytes\n", pcTaskGetName(NULL),
                     uxTaskGetStackHighWaterMark(ConnectWiFiTaskHandle));
+      reportTaskStacks("after MQTT subscribe");
       retry = 3; // Ping Retry
       wifiCasePtr++;
     } break;
@@ -1179,8 +1279,11 @@ void wifiConnectTask(void *parameter) {
         digitalWrite(LED_MQTT_CONNECTED, HIGH);
         pingDeadlineMs = 0;
 
-        // Sync IOT Settings (Operators)
+        // Sync operators first; defer local measurement upload so a large
+        // #OPERATORS transfer does not starve #IOT_DATA / ACK.
         mqttSendSync();
+        pendingIotDataPush = true;
+        iotDataPushAfterMs = millis() + 4000UL;
         retry = 3; // Push IOT data retry
         wifiCasePtr = 9;
       } else if (pingDeadlineMs != 0 && (long)(millis() - pingDeadlineMs) >= 0) {
@@ -1212,30 +1315,62 @@ void wifiConnectTask(void *parameter) {
       mqttServiceLoop(); // Keep MQTT Alive
 
       if (WiFi.status() != WL_CONNECTED) {
+        // Out of range / AP lost — reconnect WiFi+MQTT only.
+        // Do NOT go to case 0: that tears down NimBLE (blue LED) and blocks recovery.
         PrintDebug("Lost WIFI Connection", PRINT_WIFI_DEBUG);
+        isWifiConnected = false;
         isMqttServiceConnected = false;
-        wifiCasePtr = 0; // Restart connection
+        if (mqttServer.connected()) {
+          mqttServer.disconnect();
+        }
+        // Ensure base can find us again over BLE when back in range
+        if (!isBluetoothConnected) {
+          bt_StartAdvertising();
+        }
+        wifiCasePtr = 3;
       } else if (!mqttServer.connected()) {
         PrintDebug("Lost MQTT Connection", PRINT_WIFI_DEBUG);
         isMqttServiceConnected = false;
-        wifiCasePtr = 5; // Reconnect MQTT
+        wifiCasePtr = 5; // Reconnect MQTT (WiFi still up)
       }
 
-      // Push measurements
-      if (iotDataCount > 0 && !isSessionOpen) {
-       wifiCasePtr = 20;
+      // Push stored measurements when online (session may stay open).
+      // Skip only while actively measuring / pairing / operators mid-apply.
+      if (wifiCasePtr == 9 && !isRunningLive && !isPairing &&
+          !pendingOperatorsUpdate) {
+        if (pendingIotDataPush &&
+            (long)(millis() - iotDataPushAfterMs) >= 0) {
+          pendingIotDataPush = false;
+          // Flash is source of truth after roam / partial RAM use
+          readIotDataFile();
+          PrintDebug(String("Reconnect push check: ") + String(iotDataCount) +
+                         " measurement(s)",
+                     PRINT_WIFI_DEBUG);
+        }
+        if (iotDataCount > 0) {
+          if (retry <= 0) {
+            retry = 3;
+          }
+          wifiCasePtr = 20;
+        }
       }
 
-      // Push Manually
-      // if (newNumKeyPressed) {
-      //   newNumKeyPressed = false;
-    
-      //   if(strcmp(key, KEY_0) == 0)
-      //   {
-      //     wifiCasePtr = 20;
-      //   }
-      // }
-      
+      // Keep BLE discoverable after WiFi/MQTT roam (coexistence can stop advertising)
+      if (pServer != nullptr) {
+        const uint32_t blePeers = pServer->getConnectedCount();
+        isBluetoothConnected = (blePeers > 0);
+        if (blePeers == 0) {
+          static unsigned long lastBleAdvRefreshMs = 0;
+          if ((millis() - lastBleAdvRefreshMs) > 10000UL) {
+            lastBleAdvRefreshMs = millis();
+            NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+            if (pAdv == nullptr || !pAdv->isAdvertising()) {
+              bt_StartAdvertising();
+            }
+          }
+        }
+      }
+
       vTaskDelay(500 / portTICK_PERIOD_MS);
     } break;
 
@@ -1350,7 +1485,6 @@ void wifiConnectTask(void *parameter) {
 }
 void IotTask(void *parameter) {
   bool printed = false;
-  bool showStack = true;
 
   for (;;) {
     if (!printed) {
@@ -1358,7 +1492,6 @@ void IotTask(void *parameter) {
       printed = true;
     }
 
-    // Keep 1 ms cadence — vTaskDelay(0) at higher priority starves buzzer/LCD
     vTaskDelay(1 / portTICK_PERIOD_MS);
 
     DebounceWheelSensor1();
@@ -1369,78 +1502,61 @@ void IotTask(void *parameter) {
       wheelCasePtr = 0;
     }
 
-    if (showStack) {
-      showStack = false;
-      Serial.printf("%s Stack free: %u bytes\n", pcTaskGetName(NULL),
-                    uxTaskGetStackHighWaterMark(IotTaskHandle));
-    }
-
+    // Lean tick path only — no LCD / Serial / stall logic here
     switch (wheelCasePtr) {
-    case 0: {
-      // Forward
-      if (wheelSensor1Low)
+    case 0:
+      if (wheelSensor1Low) {
         wheelCasePtr = 10;
-
-      // Reverse (ignored during cal/live)
-      if (wheelSensor2Low && !isCalibrating && !isRunningLive)
+      } else if (wheelSensor2Low) {
         wheelCasePtr = 20;
-    } break;
+      }
+      break;
 
-    // Forward
-    case 10: {
-      if (!wheelSensor1Low)
-        wheelCasePtr++;
-
-      if (wheelSensor2Low)
-        wheelCasePtr = 0;
-    } break;
-
-    case 11: {
-      if (!wheelSensor2Low)
-        wheelCasePtr++;
-
-      if (wheelSensor1Low)
-        wheelCasePtr = 0;
-    } break;
-
-    case 12:
-      if (!wheelSensor2Low) {
-        wheelTicksCount++;
-        wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
-        wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
+    case 10: // forward: wait S1 release
+      if (!wheelSensor1Low) {
+        wheelCasePtr = 11;
+      } else if (wheelSensor2Low) {
         wheelCasePtr = 0;
       }
       break;
 
-    // Reverse
-    case 20: {
-      if (!wheelSensor2Low)
-        wheelCasePtr++;
-
-      if (wheelSensor1Low)
+    case 11: // forward: S2 high → count
+      if (!wheelSensor2Low) {
+        wheelTicksCount++;
+        wheelTicksForward++;
+        pendingWheelLcdActivity = true;
         wheelCasePtr = 0;
-    } break;
-
-    case 21: {
-      if (wheelSensor1Low)
-        wheelCasePtr++;
-
-      if (wheelSensor2Low)
-        wheelCasePtr = 0;
-    } break;
-
-    case 22: {
-      if (!wheelSensor1Low) {
-        // Cal / live: forward-only — reverse bounce must not shrink distance
-        if (wheelTicksCount > 0 && !isCalibrating && !isRunningLive) {
-          wheelTicksCount--;
-        }
-
-        wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
-        wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
+      } else if (wheelSensor1Low) {
         wheelCasePtr = 0;
       }
-    } break;
+      break;
+
+    case 20: // reverse: wait S2 release
+      if (!wheelSensor2Low) {
+        wheelCasePtr = 21;
+      } else if (wheelSensor1Low) {
+        wheelCasePtr = 0;
+      }
+      break;
+
+    case 21: // reverse: wait S1 assert
+      if (wheelSensor1Low) {
+        wheelCasePtr = 22;
+      } else if (wheelSensor2Low) {
+        wheelCasePtr = 0;
+      }
+      break;
+
+    case 22: // reverse: S1 release → decrement
+      if (!wheelSensor1Low) {
+        wheelTicksReverse++;
+        if (wheelTicksCount > 0) {
+          wheelTicksCount--;
+        }
+        pendingWheelLcdActivity = true;
+        wheelCasePtr = 0;
+      }
+      break;
 
     default:
       wheelCasePtr = 0;
@@ -1527,12 +1643,10 @@ void DebounceWheelSensor1() {
     }
     debWheel1Low = true;
     wheelSensor1Low = true;
-    PrintDebug("Sensor1 Low", PRINT_DEBOUNCE_DEBUG);
   } else {
     if (digitalRead(SENSOR_WHEEL_1) == HIGH) {
       debWheel1Low = false;
       wheelSensor1Low = false;
-      PrintDebug("Sensor1 Hi", PRINT_DEBOUNCE_DEBUG);
     }
   }
 }
@@ -1543,13 +1657,11 @@ void DebounceWheelSensor2() {
     }
     debWheel2Low = true;
     wheelSensor2Low = true;
-    PrintDebug("Sensor2 Low", PRINT_DEBOUNCE_DEBUG);
   } else {
     if (digitalRead(SENSOR_WHEEL_2) == HIGH) {
       debWheel2Low = false;
       debWheel2LastTime = 0;
       wheelSensor2Low = false;
-      PrintDebug("Sensor2 Hi", PRINT_DEBOUNCE_DEBUG);
     }
   }
 }
@@ -1747,6 +1859,14 @@ void lcdWrite(String line1, String line2) {
 void lcdWrite(String line1, String line2, bool showMeasureCnt) {
   lcdWrite(line1.c_str(), line2.c_str(), showMeasureCnt);
 }
+
+static void noteLcdActivity() {
+  lcdActivityMs = millis();
+  if (!lcdBacklightIsOn) {
+    lcdBacklightIsOn = true;
+    pendingLcdBacklightOn = true;
+  }
+}
 void lcdSetLanesPrompt() {
   char laneLine[17];
   snprintf(laneLine, sizeof(laneLine), "Set Lanes: %s", nrOfLanesToCut);
@@ -1890,15 +2010,41 @@ bool getKeypad(char *out, size_t outSize) {
       continue;
     }
 
+    noteLcdActivity(); // press starts — wake / reset idle timer (incl. long hold)
+
+    const unsigned long pressStartMs = millis();
+    const char *src = keys[pressedRow][c];
+    bool distanceResetFired = false;
+    // Live/measure: STOP hold zeros distance. Calibrate: CLOSE hold zeros ticks.
+    const bool holdStopZeroOk = isRunningLive || (mainCasePtr == 23);
+    const bool holdCloseZeroOk = isCalibrating || (mainCasePtr == 53);
+
     while (digitalRead(rowPins[pressedRow]) == LOW) {
+      if (!distanceResetFired &&
+          ((holdStopZeroOk && strcmp(src, KEY_STOP) == 0) ||
+           (holdCloseZeroOk && strcmp(src, KEY_CLOSE) == 0)) &&
+          (millis() - pressStartMs) >= DISTANCE_RESET_HOLD_MS) {
+        pendingDistanceReset = true;
+        distanceResetFired = true;
+        noteLcdActivity();
+      }
+      // Never block forever if a key sticks after a long cal session
+      if ((millis() - pressStartMs) > 15000UL) {
+        break;
+      }
       vTaskDelay(1 / portTICK_PERIOD_MS);
     }
+    lastKeyHeldMs = millis() - pressStartMs;
 
     for (int i = 0; i < COLS; i++) {
       digitalWrite(colPins[i], HIGH);
     }
 
-    const char *src = keys[pressedRow][c];
+    // Hold-reset already applied — do not treat release as Stop/disconnect
+    if (distanceResetFired) {
+      return false;
+    }
+
     strncpy(out, src, outSize - 1);
     out[outSize - 1] = '\0';
     return true;
@@ -2012,6 +2158,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
       wheelTicksCount = 0;
       hasNewCalibrateValue = false;
+      resetWheelPulseState();
 
       // Send Confirmation MQTT
       MqttJsonDoc mqttPacket;
@@ -2070,6 +2217,33 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
       mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
     }
 
+    // UNPAIR MONITOR — base removed us from paired list; stop MQTT until re-pair
+    if (_cmd == MQTT_CMD_UNPAIR_MONITOR) {
+      androidConnected = false;
+      connectedDeviceId = fromDeviceId;
+      isRunningLive = false;
+
+      // Ack while MQTT is still up
+      MqttJsonDoc mqttPacket;
+      mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+      mqttPacket[MQTT_JSON_TO_DEVICE_ID] = fromDeviceId;
+      mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+      mqttPacket[MQTT_JSON_PAYLOAD] = "";
+      mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_UNPAIR_MONITOR;
+      mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
+
+      // Same effect as BLE SHOESH: keep WiFi/BLE, do not MQTT until pair/new creds
+      mqttBlockedByBase = true;
+      gotPing = false;
+      pingDeadlineMs = 0;
+      isMqttServiceConnected = false;
+      digitalWrite(LED_MQTT_CONNECTED, LOW);
+      pendingMqttDisconnect = true;
+      wifiCasePtr = 15;
+      buzzerOn(2, 80, 60);
+      PrintDebug("UNPAIR_MONITOR: MQTT stopped to this base", PRINT_GENERAL_DEBUG);
+    }
+
     // SYNC SETTINGS (ticks/m from app Sync button — ack back to app)
     if (_cmd == MQTT_CMD_SYNC_SETTINGS) {
       const char *iotType = _payloadJson[JSON_IOT_TYPE].as<const char *>();
@@ -2080,6 +2254,7 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
       applyTicksPerMeterFromJson(_payloadJson);
       syncSettingsUiPending = true;
+      resetWheelPulseState();
 
       MqttJsonDoc mqttPacket;
       mqttPacket[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
@@ -2350,6 +2525,7 @@ void requestLiveDisconnect(const char *reason) {
   isRunningLive = false;
   androidConnected = false;
   pendingMqttDisconnectMonitor = true;
+  pendingDistanceReset = false;
   startKeyPressed = false;
   stopKeyPressed = false;
   enterKeyPressed = false;
@@ -2462,17 +2638,21 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
     PrintDebug("BT Client connected", PRINT_BT_DEBUG);
     isBluetoothConnected = true;
 
-    // If already in pair mode, tell the base immediately
+    // If already in pair mode, tell the base immediately (IDLE→PAIRING edge)
     if (isPairing || requestFreshMqttBrokerIp) {
+      bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
+      lastPairingNotifyMs = millis();
     }
   }
 
   void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) {
     Serial.printf("BT Client disconnected: %s \n",
                   connInfo.getAddress().toString().c_str());
-    NimBLEDevice::startAdvertising();
     isBluetoothConnected = false;
+    // Full advert payload (name + service UUID) — bare startAdvertising() is not enough
+    // after WiFi roam, and base needs this to reconnect the blue LED link.
+    bt_StartAdvertising();
   }
 };
 class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
@@ -2544,6 +2724,7 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         mqttBlockedByBase = false;
         requestFreshMqttBrokerIp = false;
         pendingMqttServerUpdate = true;
+        buzzerOn(1, 100, 0);
 
         // SSID/password change (or not associated): must WiFi.begin again.
         // MQTT-only reconnect is not enough — ESP may still be on the old AP.
@@ -2552,10 +2733,13 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         if (ssidOrPwChanged || !onCorrectWifi) {
           isWifiConnected = false;
           isMqttServiceConnected = false;
+          gotPing = false;
           WiFi.disconnect(false);
           wifiCasePtr = 3;
-        } else {
+        } else if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
+          // Same AP — start MQTT handshake only if not already in progress
           isMqttServiceConnected = false;
+          gotPing = false;
           wifiCasePtr = 5;
         }
 
@@ -2582,9 +2766,11 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
 
     PrintDebug("BT Client subscribed to notifications", PRINT_BT_DEBUG);
 
-    // Base is listening — push current pairing state
+    // Base is listening — push current pairing state (force notify edge)
     if (isPairing || requestFreshMqttBrokerIp) {
+      bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
+      lastPairingNotifyMs = millis();
     } else {
       bt_NotifyStatus(CMD_BT_IDLE);
     }
@@ -2628,6 +2814,7 @@ void bt_StartServer() {
   // Create Server
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new BT_ServerCallbacks());
+  pServer->advertiseOnDisconnect(true);
 
   // Create Comms Service
   pService = pServer->createService(SERVICE_UUID);
@@ -2641,9 +2828,25 @@ void bt_StartServer() {
   PrintDebug((String("BT Server Started: ") + myDeviceId), PRINT_BT_DEBUG);
 }
 void bt_StartAdvertising() {
-  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
-  NimBLEAdvertisementData advData;
+  if (pServer == nullptr) {
+    return;
+  }
+  // Already linked — advertising is off by design while connected
+  if (pServer->getConnectedCount() > 0) {
+    isBluetoothConnected = true;
+    return;
+  }
+  isBluetoothConnected = false;
 
+  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+  if (pAdv == nullptr) {
+    return;
+  }
+  if (pAdv->isAdvertising()) {
+    NimBLEDevice::stopAdvertising();
+  }
+
+  NimBLEAdvertisementData advData;
   advData.setFlags(0x06); // general discoverable + BR/EDR not supported
   advData.addServiceUUID(SERVICE_UUID);
   pAdv->setAdvertisementData(advData);
@@ -2658,17 +2861,43 @@ void bt_StartAdvertising() {
 
 // Read/Write Prevs (Credentials)
 static float ticksPerMeterForDistance() {
-  return settingsTicksPerMeter >= 0.1f ? settingsTicksPerMeter : 20.0f;
+  if (!isfinite(settingsTicksPerMeter) || settingsTicksPerMeter < 0.1f) {
+    return 20.0f;
+  }
+  // Guard against absurd cal values that make distance appear frozen
+  if (settingsTicksPerMeter > 10000.0f) {
+    return 10000.0f;
+  }
+  return settingsTicksPerMeter;
+}
+
+static void syncWheelDistanceFromTicks() {
+  wheelDistance = (double)wheelTicksCount / ticksPerMeterForDistance();
+  wheelDistance = roundf(wheelDistance * 100.0f) / 100.0f;
+}
+
+static void resetWheelTickCounters() {
+  wheelTicksCount = 0;
+  wheelTicksForward = 0;
+  wheelTicksReverse = 0;
+}
+
+static void logWheelTickBreakdown(const char *where) {
+  Serial.printf("%s: dist=%.2fm net=%d fwd=%d rev=%d\n", where, wheelDistance,
+                wheelTicksCount, wheelTicksForward, wheelTicksReverse);
 }
 
 static void applyTicksPerMeterFromJson(JsonObject json) {
   if (json[JSON_SET_TICKS_PER_M].isNull()) {
     return;
   }
-  settingsTicksPerMeter = json[JSON_SET_TICKS_PER_M].as<float>();
-  if (settingsTicksPerMeter < 0.1f) {
-    settingsTicksPerMeter = 20.0f;
+  float tpm = json[JSON_SET_TICKS_PER_M].as<float>();
+  if (!isfinite(tpm) || tpm < 0.1f) {
+    tpm = 20.0f;
+  } else if (tpm > 10000.0f) {
+    tpm = 10000.0f;
   }
+  settingsTicksPerMeter = tpm;
   newSettingsRecieved = true;
 }
 
@@ -3104,6 +3333,10 @@ void processPendingOperatorsUpdate() {
 
   loadOperatorsFromJsonArray(operatorsArray);
   saveOperatorsToFile();
+
+  // Operators done — allow queued measurements to upload soon
+  pendingIotDataPush = true;
+  iotDataPushAfterMs = millis() + 500UL;
 }
 void saveOperatorsToFile() {
   File f = LittleFS.open(OPERATORS_FILE, "w");
@@ -3291,6 +3524,8 @@ void setup() {
   
   Serial.begin(9600);
   Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  // Do not set Wire.setTimeOut — it made LCD draw one character at a time
 
   pinMode(LED_BLUETOOTH, OUTPUT);
   pinMode(LED_WIFI_CONNECTED, OUTPUT);
@@ -3332,7 +3567,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(GeneralTask, 
     "GeneralTask",      // Task name
-    3000,               // Stack size (bytes)
+    STACK_GENERAL_TASK, // Stack size (bytes)
     NULL,               // Parameters
     1,                  // Priority
     &GeneralTaskHandle, // Task handle
@@ -3341,7 +3576,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(wifiConnectTask,
     "ConnectWiFiTask",      // Task name
-    12288,                  // Stack size (bytes)
+    STACK_WIFI_TASK,        // Stack size (bytes)
     NULL,                   // Parameters
     1,                      // Priority
     &ConnectWiFiTaskHandle, // Task handle
@@ -3351,11 +3586,11 @@ void setup() {
   
   xTaskCreatePinnedToCore(IotTask, 
     "IotTask",      // Task name
-    7000,           // Stack size (bytes)
+    STACK_IOT_TASK, // Stack size (bytes) — lean tick path
     NULL,           // Parameters
-    1,              // Priority (same as GeneralTask — do not starve buzzer/LCD)
+    2,              // Above loop helpers, but do not starve keypad/WiFi
     &IotTaskHandle, // Task handle
-    1               // Core 1 — keep off WiFi core 0
+    1               // Core 1
   );
 
   // vTaskResume(GeneralTaskHandle);
@@ -3373,21 +3608,57 @@ void setup() {
 
   lcd_i2c.init(); // initialize the lcd
   lcd_i2c.backlight();
+  lcdBacklightIsOn = true;
+  lcdActivityMs = millis();
 }
 void loop() {
   vTaskDelay(1 / portTICK_PERIOD_MS);
+
+  static bool stackReportDone = false;
+  static unsigned long stackReportAtMs = 0;
+  if (!stackReportDone) {
+    if (stackReportAtMs == 0) {
+      stackReportAtMs = millis() + 15000UL;
+    } else if ((long)(millis() - stackReportAtMs) >= 0) {
+      stackReportDone = true;
+      reportTaskStacks("loop ~15s");
+    }
+  }
 
   // Battery power-save LCD work must run here (same context as other lcdWrite)
   if (pendingBatteryLcdSleep) {
     pendingBatteryLcdSleep = false;
     lcdReinit();
     lcd_i2c.noBacklight();
+    lcdBacklightIsOn = false;
   }
   if (pendingBatteryLcdWake) {
     pendingBatteryLcdWake = false;
     lcdReinit();
     lcd_i2c.backlight();
+    lcdBacklightIsOn = true;
+    lcdActivityMs = millis();
     mainCasePtr = CASE_HOME; // redraw Ready / No Session
+  }
+
+  // Idle backlight wake (button / wheel) — I2C only from loop
+  if (pendingLcdBacklightOn) {
+    pendingLcdBacklightOn = false;
+    if (!batteryPowerSaveActive) {
+      lcd_i2c.backlight();
+      lcdBacklightIsOn = true;
+    }
+  }
+  if (pendingWheelLcdActivity) {
+    pendingWheelLcdActivity = false;
+    noteLcdActivity();
+  }
+
+  // Dim after 5 min with no wheel movement or key press
+  if (!batteryLow && !batteryPowerSaveActive && lcdBacklightIsOn &&
+      (millis() - lcdActivityMs) >= LCD_IDLE_BACKLIGHT_MS) {
+    lcd_i2c.noBacklight();
+    lcdBacklightIsOn = false;
   }
 
   if (calibrationCompleteUiPending) {
@@ -3405,7 +3676,7 @@ void loop() {
       newSettingsRecieved = false;
       saveSettingsToFlash();
     }
-    lcdWrite("New Settings", "");
+    lcdWrite("Sync DONE", "");
     buzzerOn(1, 200, 0);
     startTimout(DISPLAY_TIMEOUT);
     mainCasePtr = CASE_DISPLAY_RETURN_HOME;
@@ -3487,7 +3758,19 @@ void loop() {
 
   // Ready
   case 2: {
-    if(isSessionOpen) {
+    if (!isUnitPaired()) {
+      lcdWrite("Not Paired", "STOP x5 pair", true);
+      if (!notPairedWarnBeeped) {
+        notPairedWarnBeeped = true;
+        buzzerOn(2, 150, 100);
+      }
+    } else if (!hasOperatorTags()) {
+      lcdWrite("No Tags", "Present tag", true);
+      if (!noTagsWarnBeeped) {
+        noTagsWarnBeeped = true;
+        buzzerOn(2, 150, 100);
+      }
+    } else if (isSessionOpen) {
       lcdWrite(
         "Ready", 
         "(Start,End)", 
@@ -3532,13 +3815,79 @@ void loop() {
       break;
     }
 
+    // Not paired — only pairing / factory reset until base links this unit
+    if (!isUnitPaired()) {
+      if (startPairing) {
+        startPairing = false;
+        androidPaired = false;
+        mainCasePtr = CASE_PAIR;
+        break;
+      }
+      if (startFactoryReset) {
+        startFactoryReset = false;
+        mainCasePtr = CASE_FACTORY_RESET;
+        subCasePtr = SUB_CASE_NONE;
+        break;
+      }
+      startKeyPressed = false;
+      stopKeyPressed = false;
+      openKeyPressed = false;
+      closeKeyPressed = false;
+      enterKeyPressed = false;
+      calibrationMode = false;
+      tagPresented = false;
+      androidConnected = false;
+      if (newBatReadingAvailable) {
+        newBatReadingAvailable = false;
+        lcdRefresh();
+      }
+      break;
+    }
+
+    // Paired but no tags yet — warn on home; allow tag reads so tags can be
+    // reported to the base (#TAG_DATA) and synced back as operators.
+    if (!hasOperatorTags()) {
+      if (startPairing) {
+        startPairing = false;
+        androidPaired = false;
+        mainCasePtr = CASE_PAIR;
+        break;
+      }
+      if (startFactoryReset) {
+        startFactoryReset = false;
+        mainCasePtr = CASE_FACTORY_RESET;
+        subCasePtr = SUB_CASE_NONE;
+        break;
+      }
+      if (tagPresented && !isSessionOpen) {
+        tagPresented = false;
+        mainCasePtr = CASE_TAG_PRESENTED;
+        break;
+      }
+      startKeyPressed = false;
+      stopKeyPressed = false;
+      openKeyPressed = false;
+      closeKeyPressed = false;
+      enterKeyPressed = false;
+      calibrationMode = false;
+      androidConnected = false;
+      if (newBatReadingAvailable) {
+        newBatReadingAvailable = false;
+        lcdRefresh();
+      }
+      break;
+    }
+
     // start Key Pressed
      if (startKeyPressed) {
       startKeyPressed = false;
       
       if(isSessionOpen){
-        wheelTicksCount = 0;
+        resetWheelTickCounters();
         wheelDistance = 0;
+        oldDistance = 0;
+        oldWheelTicksCount = 0;
+        resetWheelPulseState();
         mainCasePtr = CASE_START_WHEEL;
         subCasePtr = 0;
         break;
@@ -3623,9 +3972,11 @@ void loop() {
     // New Operators Recieved
     if (newOperatorsRecieved) {
       newOperatorsRecieved = false;
+      noTagsWarnBeeped = false;
+      notPairedWarnBeeped = false;
       buzzerOn(1,500,0);
       
-      lcdWrite("New Operators", "");
+      lcdWrite("New Tags", "");
       startTimout(DISPLAY_TIMEOUT);
       mainCasePtr = CASE_DISPLAY_RETURN_HOME;
     }
@@ -3707,6 +4058,10 @@ void loop() {
     androidPaired = false;
     btWifiOkNotified = false;
     mqttBlockedByBase = false; // pairing may resume MQTT to this base
+    // Leave SHOESH hold state immediately so WiFi/MQTT can recover.
+    if (wifiCasePtr == 15) {
+      wifiCasePtr = ssid.isEmpty() || password.isEmpty() ? 1 : 3;
+    }
     isMqttServiceConnected = false;
     // Always wait for a fresh BT credential push this pair session.
     // Skipping this when flash still has OLD ssid/password breaks re-pair
@@ -3725,7 +4080,13 @@ void loop() {
 
     // Ensure BLE is advertising so base can push credentials
     bt_StartAdvertising();
+    // Base only sends wificred on a PAIRING *notify*. If the char was already
+    // PAIRING (stuck prior attempt) some stacks suppress a duplicate notify —
+    // force IDLE → PAIRING so the base always sees the edge.
+    bt_NotifyStatus(CMD_BT_IDLE);
+    delay(50);
     bt_NotifyStatus(CMD_BT_PAIRING);
+    lastPairingNotifyMs = millis();
 
     // Pause MQTT while waiting; WiFi may stay up until new creds arrive
     pendingMqttDisconnect = true;
@@ -3777,6 +4138,18 @@ void loop() {
 
     // Phase 0: wait for WiFi credentials from base via Bluetooth
     if (subCasePtr == 0) {
+      // Keep advertising if base dropped BLE; re-assert PAIRING until creds arrive
+      if (pServer != nullptr && pServer->getConnectedCount() == 0) {
+        bt_StartAdvertising();
+      }
+      if ((millis() - lastPairingNotifyMs) >= PAIRING_NOTIFY_RETRY_MS) {
+        lastPairingNotifyMs = millis();
+        if (isBluetoothConnected ||
+            (pServer != nullptr && pServer->getConnectedCount() > 0)) {
+          bt_NotifyStatus(CMD_BT_PAIRING);
+        }
+      }
+
       if (gotWifiCredentials && !ssid.isEmpty() && !password.isEmpty()) {
         PrintDebug("Pairing: got BT credentials", PRINT_WIFI_DEBUG);
         startTimout(PAIR_TIMEOUT);
@@ -3786,15 +4159,19 @@ void loop() {
 
         if (onCorrectWifi) {
           // Same network — only refresh MQTT / broker handshake
-          gotPing = false;
-          isMqttServiceConnected = false;
-          wifiCasePtr = 5;
+          // Do not yank an in-progress ping (cases 5–8) back to reconnect
+          if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
+            gotPing = false;
+            isMqttServiceConnected = false;
+            wifiCasePtr = 5;
+          }
           subCasePtr = 2;
           lcdWrite("Pairing...", "MQTT...");
         } else {
           // New or different SSID/password, or not connected — full WiFi join
           isWifiConnected = false;
           isMqttServiceConnected = false;
+          gotPing = false;
           wifiCasePtr = 3;
           subCasePtr = 1;
           lcdWrite("Pairing...", "WiFi...");
@@ -3807,10 +4184,12 @@ void loop() {
     if (subCasePtr == 1) {
       if (isWifiConnected || WiFi.status() == WL_CONNECTED) {
         isWifiConnected = true;
-        // Kick MQTT handshake (needed when WiFi was already up before pairing)
-        gotPing = false;
-        isMqttServiceConnected = false;
-        wifiCasePtr = 5;
+        // Kick MQTT handshake only if not already mid ping/subscribe
+        if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
+          gotPing = false;
+          isMqttServiceConnected = false;
+          wifiCasePtr = 5;
+        }
         subCasePtr = 2;
         lcdWrite("Pairing...", "MQTT...");
       }
@@ -3856,26 +4235,15 @@ void loop() {
   // (Wheel) Start - Present Tag
   case 20: {
     switch (subCasePtr) {
-      // Lets Go
+      // Session already open — go straight to operator tag (no "Lets GO" delay)
       case 0:{
-        lcdWrite("Lets GO ...", "");
-        startTimout(DISPLAY_TIMEOUT);
-        subCasePtr++;    
-      } break;
-      
-      // Start
-      case 1:{
-        if(timeoutFlag) {
-          timeoutFlag = false;
-          
-          if(isSessionOpen){
-            nrOfLanesToCut[0] = '\0';
-            laneIndex = 0;
-            tagPresented = false;
-            mainCasePtr++;
-            subCasePtr = 0;    
-          }
-        } 
+        if (isSessionOpen) {
+          nrOfLanesToCut[0] = '\0';
+          laneIndex = 0;
+          tagPresented = false;
+          mainCasePtr++;
+          subCasePtr = 0;
+        }
       } break;
       
       // (Open Session) Start Session
@@ -4032,7 +4400,12 @@ void loop() {
   case 22: {
     if (timeoutFlag) {
       timeoutFlag = false;
-      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back,Stop)");
+      resetWheelTickCounters();
+      wheelDistance = 0;
+      oldDistance = 0;
+      oldWheelTicksCount = 0;
+      resetWheelPulseState();
+      lcdWrite("Dist: 0.00m", "T:0 (Back,Stop)");
       mainCasePtr++;
       // Arm simulation for this measure pass (stop/cancel clears it)
       simulateWheelDistance = SIMULATE_WHEEL_DISTANCE;
@@ -4046,9 +4419,32 @@ void loop() {
 
   // (Wheel) Reading Distance ...
   case 23: {
-    if (oldDistance != wheelDistance) {
-      oldDistance = wheelDistance;
-      lcdWrite("Dist: " + String(wheelDistance) + "m", "(Back,Stop)");
+    if (pendingDistanceReset) {
+      pendingDistanceReset = false;
+      resetWheelTickCounters();
+      wheelDistance = 0;
+      oldDistance = 0;
+      oldWheelTicksCount = 0;
+      resetWheelPulseState();
+      lcdWrite("Dist: 0.00m", "T:0 (Back,Stop)");
+      buzzerOn(2, 80, 80);
+    }
+
+    // Refresh LCD every N ticks (I2C must not run on every pulse)
+    if (wheelTicksCount != oldWheelTicksCount ||
+        oldDistance != wheelDistance) {
+      const int tickDelta = wheelTicksCount - oldWheelTicksCount;
+      if (tickDelta >= LCD_TICK_REFRESH_EVERY || tickDelta <= -LCD_TICK_REFRESH_EVERY ||
+          (wheelTicksCount == 0 && oldWheelTicksCount != 0)) {
+        oldWheelTicksCount = wheelTicksCount;
+        syncWheelDistanceFromTicks();
+        oldDistance = wheelDistance;
+        char line1[17];
+        char line2[17];
+        snprintf(line1, sizeof(line1), "Dist: %.2fm", wheelDistance);
+        snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+        lcdWrite(line1, line2);
+      }
     }
 
     // Cancel
@@ -4061,6 +4457,15 @@ void loop() {
     // Stop
     if (stopKeyPressed) {
       stopKeyPressed = false;
+      syncWheelDistanceFromTicks();
+      oldWheelTicksCount = wheelTicksCount;
+      oldDistance = wheelDistance;
+      logWheelTickBreakdown("Measure STOP");
+      char line1[17];
+      char line2[17];
+      snprintf(line1, sizeof(line1), "Dist: %.2fm", wheelDistance);
+      snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+      lcdWrite(line1, line2);
       subCasePtr = 2;
       mainCasePtr++;
     }
@@ -4148,6 +4553,7 @@ void loop() {
     // Enter
     else if (enterKeyPressed) {
       enterKeyPressed = false;
+      syncWheelDistanceFromTicks();
       currentIotDataWheel.distance = wheelDistance;
       currentIotDataWheel.ticks = wheelTicksCount;
       currentIotDataWheel.lines = strtol(nrOfLanesToCut, nullptr, 10);
@@ -4348,6 +4754,11 @@ case 35:{
           strncpy(currentIotDataWheel.supervisorDocId, user.docId, sizeof(currentIotDataWheel.supervisorDocId) - 1 );
 
           isSessionOpen = false;
+          // Session closed — upload any stored measures when MQTT is up
+          if (isMqttServiceConnected) {
+            pendingIotDataPush = true;
+            iotDataPushAfterMs = millis();
+          }
           mainCasePtr = 46;
         }
         else{
@@ -4413,7 +4824,7 @@ case 35:{
       isCalibrating = true;
       oldDistance = 0;
       wheelDistance = 0;
-      wheelTicksCount = 0;
+      resetWheelTickCounters();
       oldWheelTicksCount = 0;
       resetWheelPulseState();
       mainCasePtr++;
@@ -4421,11 +4832,25 @@ case 35:{
   } break;
 
   case 52: {
-    lcdWrite("Ticks: " + String(wheelTicksCount), "(Back,Stop)", false);
+    char tickLine[17];
+    snprintf(tickLine, sizeof(tickLine), "Ticks: %d", wheelTicksCount);
+    lcdWrite(tickLine, "(Back,Stop)"); // 2-arg: no battery% / ADC on every refresh
     mainCasePtr++;
   } break;
 
   case 53: {
+    // CLOSE held 3s — zero tick count, stay in calibration
+    if (pendingDistanceReset) {
+      pendingDistanceReset = false;
+      resetWheelTickCounters();
+      wheelDistance = 0;
+      oldWheelTicksCount = 0;
+      oldDistance = 0;
+      resetWheelPulseState();
+      lcdWrite("Ticks: 0", "(Back,Stop)");
+      buzzerOn(2, 80, 80);
+    }
+
     if (backKeyPressed) {
       backKeyPressed = false;
       isCalibrating = false;
@@ -4435,14 +4860,27 @@ case 35:{
     if (stopKeyPressed) {
       stopKeyPressed = false;
       isCalibrating = false;
+      syncWheelDistanceFromTicks();
+      oldWheelTicksCount = wheelTicksCount;
+      logWheelTickBreakdown("Calibrate STOP");
+      char tickLine[17];
+      snprintf(tickLine, sizeof(tickLine), "Ticks: %d", wheelTicksCount);
+      lcdWrite(tickLine, "(Back,Stop)");
       mainCasePtr++;
     }
 
-    // Wheel Moved — report on every tick, not only when rounded distance changes
+    // LCD every N ticks — counting stays in IotTask (no I2C there)
     if (wheelTicksCount != oldWheelTicksCount) {
-      oldWheelTicksCount = wheelTicksCount;
-      oldDistance = wheelDistance;
-      lcdWrite("Ticks: " + String(wheelTicksCount), "(Back,Stop)", false);
+      const int tickDelta = wheelTicksCount - oldWheelTicksCount;
+      if (tickDelta >= LCD_TICK_REFRESH_EVERY || tickDelta <= -LCD_TICK_REFRESH_EVERY ||
+          wheelTicksCount == 0) {
+        oldWheelTicksCount = wheelTicksCount;
+        syncWheelDistanceFromTicks();
+        oldDistance = wheelDistance;
+        char tickLine[17];
+        snprintf(tickLine, sizeof(tickLine), "Ticks: %d", wheelTicksCount);
+        lcdWrite(tickLine, "(Back,Stop)");
+      }
     }
   } break;
 
@@ -4516,20 +4954,36 @@ case 35:{
 
     oldDistance = 0;
     wheelDistance = 0;
-    wheelTicksCount = 0;
+    resetWheelTickCounters();
     oldWheelTicksCount = 0;
     lastLiveMqttTicks = 0;
     lastLiveMqttDistance = 0;
     resetWheelPulseState();
     isRunningLive = true;
+    pendingDistanceReset = false;
 
-    lcdWrite("0.00m T:0", "Live");
+    lcdWrite("0.00m", "Live T:0");
     buzzerOn(2, 100, 100);
     mainCasePtr++;
   } break;
 
   case 71: {
-    // Any key exits Live Monitor and tells the app to disconnect
+    // STOP held 3s — zero distance/ticks, stay in live
+    if (pendingDistanceReset) {
+      pendingDistanceReset = false;
+      resetWheelTickCounters();
+      wheelDistance = 0;
+      oldWheelTicksCount = 0;
+      oldDistance = 0;
+      lastLiveMqttTicks = 0;
+      lastLiveMqttDistance = 0;
+      resetWheelPulseState();
+      pendingMqttReportLive = true;
+      lcdWrite("0.00m", "Live T:0");
+      buzzerOn(2, 80, 80);
+    }
+
+    // Any other key (or short STOP) exits Live Monitor
     if (startKeyPressed || stopKeyPressed || enterKeyPressed ||
         backKeyPressed || openKeyPressed || closeKeyPressed ||
         newNumKeyPressed) {
@@ -4537,16 +4991,25 @@ case 35:{
       break;
     }
 
-    // LCD refresh on every tick — show ticks so cal vs live is comparable
+    // Two lines — LCD every N ticks
     if (wheelTicksCount != oldWheelTicksCount ||
         oldDistance != wheelDistance) {
-      oldWheelTicksCount = wheelTicksCount;
-      oldDistance = wheelDistance;
-      lcdWrite("D:" + String(wheelDistance) + "m T:" + String(wheelTicksCount),
-               "Live", false);
+      const int tickDelta = wheelTicksCount - oldWheelTicksCount;
+      if (tickDelta >= LCD_TICK_REFRESH_EVERY || tickDelta <= -LCD_TICK_REFRESH_EVERY ||
+          (wheelTicksCount == 0 && oldWheelTicksCount != 0)) {
+        oldWheelTicksCount = wheelTicksCount;
+        syncWheelDistanceFromTicks();
+        oldDistance = wheelDistance;
+        char line1[17];
+        char line2[17];
+        snprintf(line1, sizeof(line1), "%.2fm", wheelDistance);
+        snprintf(line2, sizeof(line2), "Live T:%d", wheelTicksCount);
+        lcdWrite(line1, line2);
+      }
     }
 
     // MQTT: queue until publish succeeds; always sends latest tick count
+    syncWheelDistanceFromTicks();
     if (wheelTicksCount != lastLiveMqttTicks ||
         wheelDistance != lastLiveMqttDistance) {
       pendingMqttReportLive = true;
@@ -4658,6 +5121,7 @@ case 35:{
     if (timeoutFlag) {
       timeoutFlag = false;
       lcd_i2c.noBacklight();
+      lcdBacklightIsOn = false;
     }
 
     if (newBatReadingAvailable) {
@@ -4673,6 +5137,8 @@ case 35:{
     if (wakeBacklight) {
       wakeBacklight = false;
       lcd_i2c.backlight();
+      lcdBacklightIsOn = true;
+      lcdActivityMs = millis();
       lcdWrite("Battery Low",  "", true);
       startTimout(DISPLAY_TIMEOUT);
     }
