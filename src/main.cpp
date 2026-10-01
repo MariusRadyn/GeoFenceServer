@@ -87,6 +87,10 @@ char settingsIotType[32] = {0};
 char settingsIotName[32] = {0};
 char settingsUserDocId[29] = {0};
 char settingsMonDocId[29] = {0};
+// Saved at pair-start; restored if pair is cancelled / times out
+static char pairBackupUserDocId[29] = {0};
+static char pairBackupMonDocId[29] = {0};
+static bool pairHadPriorLink = false;
 float settingsTicksPerMeter = 20.0f;
 
 int wifiCasePtr = 0;
@@ -113,12 +117,44 @@ const String CMD_BT_PAIRING = "PAIRING";
 const String CMD_BT_IDLE = "IDLE";
 const String CMD_BT_WIFI_OK = "WIFI_OK";
 const String CMD_BT_SHOESH = "SHOESH"; // Base reject: stop MQTT to this broker
+// Direct Android operator push over BLE (no WiFi / base). Subscribe to NOTIFY.
+// 1) Request MTU 512
+// 2) ops:begin><operatorsVer>><totalJsonBytes>
+//    → notify OPS_ACK>BEGIN><totalJsonBytes>
+// 3) ops:data><utf8 chunk>   (sequential; chunk size ≤ MTU−3−9)
+//    → notify OPS_ACK>RX><bytesReceivedSoFar>
+// 4) ops:end
+//    → notify OPS_ACK>END then OPS_OK><userCount> (or OPS_ERR>…)
+// Small lists: ops:json>{"operatorsVer":"1","operatorsList":[...]}  (or raw [...])
+const String CMD_BT_OPS_BEGIN = "ops:begin>";
+const String CMD_BT_OPS_DATA = "ops:data>";
+const String CMD_BT_OPS_END = "ops:end";
+const String CMD_BT_OPS_JSON = "ops:json>";
+const String CMD_BT_OPS_ACK_BEGIN = "OPS_ACK>BEGIN>";
+const String CMD_BT_OPS_ACK_RX = "OPS_ACK>RX>";
+const String CMD_BT_OPS_ACK_END = "OPS_ACK>END";
+const String CMD_BT_OPS_OK = "OPS_OK>";
+const String CMD_BT_OPS_ERR = "OPS_ERR>";
+const char *BT_OPS_TEMP_FILE = "/ops_bt.tmp";
+// Android tag enroll over BLE (no WiFi / base):
+//   write tag:req  → notify TAG_ACK>LISTEN
+//   present Dallas tag → notify TAG_DATA><16 hex chars>
+//   write tag:cancel → notify TAG_ACK>CANCEL
+const String CMD_BT_TAG_REQ = "tag:req";
+const String CMD_BT_TAG_CANCEL = "tag:cancel";
+const String CMD_BT_TAG_ACK_LISTEN = "TAG_ACK>LISTEN";
+const String CMD_BT_TAG_ACK_CANCEL = "TAG_ACK>CANCEL";
+const String CMD_BT_TAG_DATA = "TAG_DATA>";
+volatile bool btTagListenActive = false;
+unsigned long btTagListenDeadlineMs = 0;
+#define BT_TAG_LISTEN_TIMEOUT_MS 60000UL
 bool mqttBlockedByBase = false;        // set by SHOESH; cleared on pair / new creds
 // MQTT is WiFi-task only — other tasks set these flags
 volatile bool pendingMqttDisconnect = false;
 volatile bool pendingMqttReportTag = false;
 volatile bool pendingMqttReportLive = false;
 volatile bool pendingMqttDisconnectMonitor = false;
+volatile bool pendingMqttSendSync = false; // pair done / deferred #SYNC from UI task
 
 // Button Debounce
 volatile bool debPairFallEdge = false;
@@ -147,7 +183,7 @@ volatile bool wheelSensor2Low = false;
 // Wheel pulse FSM — polled (same sequence that was counting before quad rewrite)
 static volatile bool wheelFsmReset = false;
 static int wheelCasePtr = 0;
-#define LCD_TICK_REFRESH_EVERY 10 // rewrite LCD every N ticks (I2C is slow)
+#define LCD_TICK_REFRESH_EVERY 2 // rewrite LCD every N ticks (I2C is slow)
 
 static void resetWheelPulseState();
 constexpr size_t JSON_MAX_CMD = 32; // MAX Len
@@ -168,6 +204,7 @@ const String MQTT_CMD_IOT_DATA = "#IOT_DATA";
 const String MQTT_CMD_SETTINGS = "#REQ_SETTINGS";
 const String MQTT_CMD_SYNC = "#SYNC";
 const String MQTT_CMD_OPERATORS = "#OPERATORS";
+const String MQTT_CMD_REQ_OPERATORS = "#REQ_OPERATORS"; // Base asks for local tags
 const String MQTT_CMD_NEW_DATA_AVAILABLE = "#NEW_DATA_AVAILABLE";
 
 
@@ -226,6 +263,7 @@ const char *FLASH_WIFI_CRED = "wifi";
 
 #define MQTT_PAYLOAD_MAX 512
 #define MQTT_RX_BUFFER_SIZE 12288
+#define MQTT_TX_OPERATORS_MAX 12288
 #define MAX_OPERATORS_JSON_SIZE 12288
 using MqttJsonDoc =
     StaticJsonDocument<JSON_OBJECT_SIZE(5) +        // root
@@ -453,7 +491,11 @@ bool isPairing = false;
 bool clearWifiCredsOnPairFail = false; // wipe WiFi only on first-pair cancel/timeout
 bool btWifiOkNotified = false;
 unsigned long lastPairingNotifyMs = 0;
+unsigned long pairBtCredsWaitStartMs = 0; // case 10: when we started waiting for BT wificred
 #define PAIRING_NOTIFY_RETRY_MS 2000UL
+// If base does not re-push wificred (already correct), proceed with flash creds
+#define PAIR_BT_CREDS_FALLBACK_MS 8000UL
+#define PAIR_BT_CREDS_FALLBACK_FAST_MS 3000UL // already on correct WiFi
 bool androidConnected = false;
 bool calibrationMode = false;
 bool androidPaired = false;
@@ -468,9 +510,18 @@ int buzzerOnTime = 0;
 int buzzerOffTime = 0;
 volatile bool locateActive = false;
 volatile int locateLedFlashesLeft = 0;
+volatile bool btLedFlashUntilTag = false; // blue LED blinks until tag / cancel / disconnect
 bool showMqttWarning = true;
 volatile bool pendingOperatorsUpdate = false;
+volatile bool pendingBtOpsOkNotify = false; // notify OPS_OK after apply (BLE push)
+volatile bool pendingBtOpsFinalize = false; // BLE assembled JSON — apply on GeneralTask
 bool newOperatorsRecieved = false;
+// BLE operator push: assemble in RAM (never parse/FS inside NimBLE onWrite)
+bool btOpsActive = false;
+size_t btOpsExpected = 0;
+size_t btOpsReceived = 0;
+char btOpsVer[48] = "";
+static char btOpsRam[MAX_OPERATORS_JSON_SIZE + 1];
 bool wakeBacklight = false;
 volatile unsigned long lcdActivityMs = 0;
 volatile bool lcdBacklightIsOn = true;
@@ -533,10 +584,17 @@ void bt_StopServer();
 void bt_StartServer();
 void bt_StartAdvertising();
 void bt_NotifyStatus(const String &status);
+void btOpsReset(bool removeTemp);
+void btOpsAbort(const char *reason);
+bool btOpsAppendRam(const uint8_t *data, size_t len);
+void btOpsQueueFinalize();
+void processBtOpsFinalize();
+void btOpsHandleWrite(const String &rxData);
 void applyBatteryPowerSave();
 void clearBatteryPowerSave();
 void lcdReinit();
 bool mqttTX(const JsonDocument &msg, const String &topic);
+bool mqttTXLarge(const JsonDocument &msg, const String &topic, size_t maxBytes);
 void mqttRx(char *topic, byte *payload, unsigned int length);
 void PrintDebug(String, bool);
 void lcdWrite(const char *line1, const char *line2);
@@ -578,6 +636,7 @@ void getAllReadings(std::vector<IotData_Wheel> &data);
 bool wifiCredentialsExist();
 String tagToString(byte *addr);
 void mqttSendSync();
+void mqttSendOperatorsReport();
 void mqttServiceLoop();
 void mqttProcessDeferred(); // WiFi task only — disconnect / queued publishes
 static float ticksPerMeterForDistance();
@@ -589,6 +648,7 @@ void writeSessionNrToFile(const char *session);
 void deleteIotDataFile();
 void deleteSessionNrFile();
 void resetIotData();
+void readIotDataFile();
 
 //------------------------------------------------------------------------------------------------
 // Code
@@ -774,11 +834,20 @@ void GeneralTask(void *parameter) {
     } 
     // Normal Running
     else {
-      // Blue - Bluetooth  
-      if (isBluetoothConnected)
+      // Blue - Bluetooth (flash until tag presented / cancel / disconnect)
+      if ((btLedFlashUntilTag || btTagListenActive) && !batteryPowerSaveActive) {
+        static int btFlashDelay = 0;
+        static bool btFlashOn = false;
+        if (btFlashDelay++ >= 80) {
+          btFlashDelay = 0;
+          btFlashOn = !btFlashOn;
+          digitalWrite(LED_BLUETOOTH, btFlashOn ? HIGH : LOW);
+        }
+      } else if (isBluetoothConnected) {
         digitalWrite(LED_BLUETOOTH, HIGH); // Blue
-      else
+      } else {
         digitalWrite(LED_BLUETOOTH, LOW);
+      }
 
       // Red - Wifi
       if (isWifiConnected)
@@ -936,8 +1005,40 @@ void GeneralTask(void *parameter) {
 
           String tag = tagToString(tagCode);
           PrintDebug("Tag Code: " + tag, PRINT_GENERAL_DEBUG);
+
+          // BLE enroll: notify Android immediately (bypass home lockouts /
+          // not-paired / session gates that would clear tagPresented).
+          if (btTagListenActive && pServer != nullptr &&
+              pServer->getConnectedCount() > 0) {
+            bt_NotifyStatus(CMD_BT_TAG_DATA + tag);
+            btTagListenActive = false;
+            btTagListenDeadlineMs = 0;
+            btLedFlashUntilTag = false;
+            PrintDebug(String("BT TAG_DATA (immediate) ") + tag, PRINT_BT_DEBUG);
+          }
         }
       }
+    }
+
+    // Apply operators queued from MQTT or BLE (works with WiFi off)
+    if (pendingOperatorsUpdate) {
+      processPendingOperatorsUpdate();
+    }
+    // BLE push assembled in RAM — parse/save here (not in NimBLE callback)
+    if (pendingBtOpsFinalize) {
+      processBtOpsFinalize();
+    }
+    if (pendingBtOpsOkNotify) {
+      pendingBtOpsOkNotify = false;
+      bt_NotifyStatus(CMD_BT_OPS_OK + String(userCount));
+    }
+    if (btTagListenActive && btTagListenDeadlineMs != 0 &&
+        (long)(millis() - btTagListenDeadlineMs) >= 0) {
+      btTagListenActive = false;
+      btTagListenDeadlineMs = 0;
+      btLedFlashUntilTag = false;
+      bt_NotifyStatus(String("TAG_ACK>TIMEOUT"));
+      PrintDebug("BT tag listen timeout", PRINT_BT_DEBUG);
     }
 
     // Buzzer
@@ -1292,6 +1393,19 @@ void wifiConnectTask(void *parameter) {
         retry--;
 
         if (retry <= 0) {
+          // During pairing the base often ignores #PING until the device is
+          // in its paired list / app pair mode — but broker connect is enough
+          // to receive #DISCOVER. Do not stay stuck on "MQTT...".
+          if (isPairing && mqttServer.connected()) {
+            PrintDebug("Pairing: MQTT broker up — continue without PING ACK",
+                       PRINT_WIFI_DEBUG);
+            isMqttServiceConnected = true;
+            digitalWrite(LED_MQTT_CONNECTED, HIGH);
+            retry = 3;
+            wifiCasePtr = 9;
+            break;
+          }
+
           PrintDebug("Connection Failed after retries", PRINT_WIFI_DEBUG);
           // MQTT-only retry — do not tear down BLE (NimBLE deinit while a
           // client is connected can InstrFetchProhibited / PC=0).
@@ -2321,6 +2435,14 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
 
         mqttTX(mqttPacket, MQTT_TOPIC_FROM_IOT);
         androidPaired = true;
+
+        // New / re-paired units often never got #SYNC (no PING ACK during
+        // pair, or iotType was empty). Pull operators now that settings exist.
+        if (!settingsIotType[0]) {
+          strlcpy(settingsIotType, IOT_TYPE_WHEEL, sizeof(settingsIotType));
+        }
+        mqttSendSync();
+        PrintDebug("FOUND_MONITOR: requested operator #SYNC", PRINT_WIFI_DEBUG);
       }
     }
 
@@ -2381,6 +2503,11 @@ void mqttRx(char *topic, byte *payload, unsigned int length) {
         queueOperatorsUpdate(operatorsArray);
       }
     }
+
+    // Base requests local operators (IoT ver newer than cloud)
+    if (_cmd == MQTT_CMD_REQ_OPERATORS) {
+      mqttSendOperatorsReport();
+    }
   }
 }
 bool mqttTX(const JsonDocument &msg, const String &topic) {
@@ -2417,6 +2544,31 @@ bool mqttTX(const JsonDocument &msg, const String &topic) {
   }
   return ok;
 }
+bool mqttTXLarge(const JsonDocument &msg, const String &topic, size_t maxBytes) {
+  if (!isWifiConnected || !mqttServer.connected()) {
+    Serial.println("MQTT not connected");
+    return false;
+  }
+
+  size_t payloadSize = measureJson(msg);
+  if (payloadSize == 0 || payloadSize >= maxBytes) {
+    Serial.printf("MQTT large payload invalid %u (max %u)\n",
+                  (unsigned)payloadSize, (unsigned)maxBytes);
+    return false;
+  }
+
+  char *payload = (char *)malloc(payloadSize + 1);
+  if (!payload) {
+    Serial.println("MQTT TX alloc failed");
+    return false;
+  }
+
+  size_t len = serializeJson(msg, payload, payloadSize + 1);
+  bool ok = mqttServer.publish(topic.c_str(), (const uint8_t *)payload, len);
+  Serial.printf("MQTT TX large: %u bytes %s\n", (unsigned)len, ok ? "OK" : "FAIL");
+  free(payload);
+  return ok;
+}
 void mqttSendPing() {
   gotPing = false;
   MqttJsonDoc mqttPacket;
@@ -2438,15 +2590,13 @@ void mqttSendSync() {
   mqttPacket[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
   mqttPacket[MQTT_JSON_CMD] = MQTT_CMD_SYNC;
 
-  String iotType = settingsIotType[0] ? settingsIotType : "";
-  
-  if (iotType.isEmpty()) {
-    PrintDebug("IOT Type is empty, cannot send SYNC", PRINT_ERRORS);
-    return;
+  // New wheels may not have iotType in flash until FOUND_MONITOR — default
+  if (!settingsIotType[0]) {
+    strlcpy(settingsIotType, IOT_TYPE_WHEEL, sizeof(settingsIotType));
   }
 
   // Distance Wheel (Sync Operarators)
-  if (iotType == IOT_TYPE_WHEEL) {
+  if (strcmp(settingsIotType, IOT_TYPE_WHEEL) == 0) {
     JsonObject payload = mqttPacket.createNestedObject(MQTT_JSON_PAYLOAD);
     String operateVer = readOperatorVerFile();
     
@@ -2457,8 +2607,53 @@ void mqttSendSync() {
     return;
   }
   else{  
-    PrintDebug("Sync Error: Unknown IOT Type: " + iotType, PRINT_ERRORS);
+    PrintDebug(String("Sync Error: Unknown IOT Type: ") + settingsIotType,
+               PRINT_ERRORS);
   }
+}
+void mqttSendOperatorsReport() {
+  // Report local tags to base (after BLE sync / #REQ_OPERATORS)
+  if (userCount == 0) {
+    PrintDebug("REQ_OPERATORS: no local operators", PRINT_WIFI_DEBUG);
+    return;
+  }
+
+  DynamicJsonDocument doc(MQTT_TX_OPERATORS_MAX);
+  doc[MQTT_JSON_FROM_DEVICE_ID] = myDeviceId;
+  doc[MQTT_JSON_TO_DEVICE_ID] = "";
+  doc[MQTT_JSON_TOPIC] = MQTT_TOPIC_FROM_IOT;
+  doc[MQTT_JSON_CMD] = MQTT_CMD_OPERATORS;
+
+  JsonObject payload = doc.createNestedObject(MQTT_JSON_PAYLOAD);
+  String operateVer = readOperatorVerFile();
+  payload[JSON_OPERATORS_VERSION] = operateVer;
+  payload[JSON_IOT_TYPE] = settingsIotType[0] ? settingsIotType : IOT_TYPE_WHEEL;
+
+  JsonArray list = payload.createNestedArray(JSON_OPERATORS_LIST);
+  for (uint16_t i = 0; i < userCount; i++) {
+    JsonObject op = list.createNestedObject();
+    String fullName = String(users[i].name);
+    int sp = fullName.indexOf(' ');
+    if (sp > 0) {
+      op[JSON_OPERATOR_NAME] = fullName.substring(0, sp);
+      op[JSON_OPERATOR_SURNAME] = fullName.substring(sp + 1);
+    } else {
+      op[JSON_OPERATOR_NAME] = fullName;
+      op[JSON_OPERATOR_SURNAME] = "";
+    }
+    op[JSON_OPERATOR_ACCESS_LEVEL] = users[i].accessLevel;
+    op[JSON_OPERATOR_TAG_ID] = tagToString(users[i].tag);
+    op[JSON_DOC_ID] = users[i].docId;
+  }
+
+  if (doc.overflowed()) {
+    PrintDebug("REQ_OPERATORS: JSON overflow", PRINT_ERRORS);
+    return;
+  }
+
+  PrintDebug(String("REQ_OPERATORS: sending ") + String(userCount) + " ops ver=" + operateVer,
+             PRINT_WIFI_DEBUG);
+  mqttTXLarge(doc, MQTT_TOPIC_FROM_IOT, MQTT_TX_OPERATORS_MAX);
 }
 void mqttServiceLoop() {
   mqttServer.loop();
@@ -2477,6 +2672,10 @@ void mqttProcessDeferred() {
   }
   if (mqttBlockedByBase || !mqttServer.connected()) {
     return;
+  }
+  if (pendingMqttSendSync) {
+    pendingMqttSendSync = false;
+    mqttSendSync();
   }
   if (pendingMqttReportTag) {
     pendingMqttReportTag = false;
@@ -2637,6 +2836,9 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) {
     PrintDebug("BT Client connected", PRINT_BT_DEBUG);
     isBluetoothConnected = true;
+    // Confirm link for phone tag sync / device pick
+    buzzerOn(2, 100, 100);
+    btLedFlashUntilTag = true;
 
     // If already in pair mode, tell the base immediately (IDLE→PAIRING edge)
     if (isPairing || requestFreshMqttBrokerIp) {
@@ -2650,6 +2852,10 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
     Serial.printf("BT Client disconnected: %s \n",
                   connInfo.getAddress().toString().c_str());
     isBluetoothConnected = false;
+    btLedFlashUntilTag = false;
+    btTagListenActive = false;
+    btTagListenDeadlineMs = 0;
+    btOpsReset(true);
     // Full advert payload (name + service UUID) — bare startAdvertising() is not enough
     // after WiFi roam, and base needs this to reconnect the blue LED link.
     bt_StartAdvertising();
@@ -2658,7 +2864,39 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
 class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
     String rxData = pCharacteristic->getValue();
-    PrintDebug("BT Rx " + String(rxData), PRINT_BT_DEBUG);
+    // Avoid flooding log with large operator chunks
+    if (rxData.startsWith(CMD_BT_OPS_DATA) || rxData.startsWith(CMD_BT_OPS_JSON)) {
+      PrintDebug(String("BT Rx ops len=") + String(rxData.length()), PRINT_BT_DEBUG);
+    } else {
+      PrintDebug("BT Rx " + String(rxData), PRINT_BT_DEBUG);
+    }
+
+    // Android tag enroll (Dallas → BLE notify)
+    if (rxData.equalsIgnoreCase(CMD_BT_TAG_REQ) ||
+        rxData.startsWith(CMD_BT_TAG_REQ)) {
+      btTagListenActive = true;
+      btTagListenDeadlineMs = millis() + BT_TAG_LISTEN_TIMEOUT_MS;
+      bt_NotifyStatus(CMD_BT_TAG_ACK_LISTEN);
+      PrintDebug("BT tag listen ON", PRINT_BT_DEBUG);
+      return;
+    }
+    if (rxData.equalsIgnoreCase(CMD_BT_TAG_CANCEL) ||
+        rxData.startsWith(CMD_BT_TAG_CANCEL)) {
+      btTagListenActive = false;
+      btTagListenDeadlineMs = 0;
+      btLedFlashUntilTag = false;
+      bt_NotifyStatus(CMD_BT_TAG_ACK_CANCEL);
+      PrintDebug("BT tag listen OFF", PRINT_BT_DEBUG);
+      return;
+    }
+
+    // Android direct operator push (no WiFi / base)
+    if (rxData.startsWith(CMD_BT_OPS_BEGIN) || rxData.startsWith(CMD_BT_OPS_DATA) ||
+        rxData.equals(CMD_BT_OPS_END) || rxData.startsWith(CMD_BT_OPS_END + String(">")) ||
+        rxData.startsWith(CMD_BT_OPS_JSON)) {
+      btOpsHandleWrite(rxData);
+      return;
+    }
 
     // Base reject: not paired — stop MQTT to this broker (keep BLE for pairing)
     if (rxData.equalsIgnoreCase(CMD_BT_SHOESH) ||
@@ -2776,6 +3014,183 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
     }
   }
 };
+void btOpsReset(bool removeTemp) {
+  btOpsActive = false;
+  btOpsExpected = 0;
+  btOpsReceived = 0;
+  btOpsVer[0] = '\0';
+  btOpsRam[0] = '\0';
+  pendingBtOpsFinalize = false;
+  if (removeTemp) {
+    LittleFS.remove(BT_OPS_TEMP_FILE); // leftover from older firmware
+  }
+}
+void btOpsAbort(const char *reason) {
+  btOpsReset(true);
+  bt_NotifyStatus(CMD_BT_OPS_ERR + String(reason ? reason : "abort"));
+  PrintDebug(String("BT ops abort: ") + (reason ? reason : ""), PRINT_BT_DEBUG);
+}
+bool btOpsAppendRam(const uint8_t *data, size_t len) {
+  if (!data || len == 0) {
+    return true;
+  }
+  if (btOpsReceived + len > MAX_OPERATORS_JSON_SIZE) {
+    return false;
+  }
+  memcpy(btOpsRam + btOpsReceived, data, len);
+  btOpsReceived += len;
+  btOpsRam[btOpsReceived] = '\0';
+  return true;
+}
+void btOpsQueueFinalize() {
+  // Signal GeneralTask — do not parse / LittleFS here (NimBLE callback).
+  pendingBtOpsFinalize = true;
+  pendingBtOpsOkNotify = true;
+  btOpsActive = false;
+}
+void processBtOpsFinalize() {
+  pendingBtOpsFinalize = false;
+
+  if (btOpsReceived == 0) {
+    btOpsAbort("empty");
+    pendingBtOpsOkNotify = false;
+    return;
+  }
+
+  DynamicJsonDocument doc(btOpsReceived + 512);
+  DeserializationError err = deserializeJson(doc, btOpsRam, btOpsReceived);
+  if (err) {
+    PrintDebug(String("BT ops parse failed: ") + err.c_str(), PRINT_ERRORS);
+    bt_NotifyStatus(CMD_BT_OPS_ERR + String("json_parse"));
+    pendingBtOpsOkNotify = false;
+    btOpsReset(false);
+    return;
+  }
+
+  const char *ver = btOpsVer[0] ? btOpsVer : nullptr;
+  JsonArray operatorsArray;
+  if (doc.is<JsonObject>()) {
+    const char *v = doc[JSON_OPERATORS_VERSION] | (const char *)nullptr;
+    if (v && v[0]) {
+      ver = v;
+    }
+    operatorsArray = doc[JSON_OPERATORS_LIST].as<JsonArray>();
+  } else if (doc.is<JsonArray>()) {
+    operatorsArray = doc.as<JsonArray>();
+  }
+
+  if (operatorsArray.isNull()) {
+    bt_NotifyStatus(CMD_BT_OPS_ERR + String("json_list"));
+    pendingBtOpsOkNotify = false;
+    btOpsReset(false);
+    return;
+  }
+
+  if (ver && ver[0]) {
+    saveOperatorVerToFile(ver);
+  } else {
+    saveOperatorVerToFile("bt");
+  }
+
+  loadOperatorsFromJsonArray(operatorsArray);
+  saveOperatorsToFile();
+
+  pendingIotDataPush = true;
+  iotDataPushAfterMs = millis() + 500UL;
+
+  PrintDebug(String("BT ops applied: ") + String(userCount) + " users",
+             PRINT_GENERAL_DEBUG);
+  btOpsReset(false);
+  // pendingBtOpsOkNotify already set — GeneralTask sends OPS_OK
+}
+void btOpsHandleWrite(const String &rxData) {
+  if (rxData.startsWith(CMD_BT_OPS_BEGIN)) {
+    const char *body = rxData.c_str() + CMD_BT_OPS_BEGIN.length();
+    const char *sep = strchr(body, '>');
+    if (!sep) {
+      btOpsAbort("begin_fmt");
+      return;
+    }
+    size_t verLen = (size_t)(sep - body);
+    if (verLen >= sizeof(btOpsVer)) {
+      verLen = sizeof(btOpsVer) - 1;
+    }
+    long total = atol(sep + 1);
+    if (total <= 0 || (size_t)total > MAX_OPERATORS_JSON_SIZE) {
+      btOpsAbort("begin_len");
+      return;
+    }
+    btOpsReset(false);
+    btOpsActive = true;
+    btOpsExpected = (size_t)total;
+    btOpsReceived = 0;
+    memcpy(btOpsVer, body, verLen);
+    btOpsVer[verLen] = '\0';
+    btOpsRam[0] = '\0';
+    bt_NotifyStatus(CMD_BT_OPS_ACK_BEGIN + String(btOpsExpected));
+    PrintDebug(String("BT ops begin ver=") + btOpsVer + " len=" + String(btOpsExpected),
+               PRINT_BT_DEBUG);
+    return;
+  }
+
+  if (rxData.startsWith(CMD_BT_OPS_JSON)) {
+    const char *payload = rxData.c_str() + CMD_BT_OPS_JSON.length();
+    size_t payloadLen = rxData.length() - CMD_BT_OPS_JSON.length();
+    if (payloadLen == 0 || payloadLen > MAX_OPERATORS_JSON_SIZE) {
+      btOpsAbort("json_len");
+      return;
+    }
+    btOpsReset(false);
+    btOpsExpected = payloadLen;
+    btOpsReceived = 0;
+    if (!btOpsAppendRam(reinterpret_cast<const uint8_t *>(payload), payloadLen)) {
+      btOpsAbort("overflow");
+      return;
+    }
+    btOpsQueueFinalize();
+    bt_NotifyStatus(CMD_BT_OPS_ACK_END);
+    PrintDebug(String("BT ops json queued (") + String(payloadLen) + " bytes)",
+               PRINT_BT_DEBUG);
+    return;
+  }
+
+  if (rxData.startsWith(CMD_BT_OPS_DATA)) {
+    if (!btOpsActive) {
+      btOpsAbort("no_begin");
+      return;
+    }
+    const char *payload = rxData.c_str() + CMD_BT_OPS_DATA.length();
+    size_t payloadLen = rxData.length() - CMD_BT_OPS_DATA.length();
+    if (btOpsReceived + payloadLen > btOpsExpected) {
+      btOpsAbort("overflow");
+      return;
+    }
+    if (!btOpsAppendRam(reinterpret_cast<const uint8_t *>(payload), payloadLen)) {
+      btOpsAbort("write");
+      return;
+    }
+    bt_NotifyStatus(CMD_BT_OPS_ACK_RX + String(btOpsReceived));
+    return;
+  }
+
+  if (rxData.equals(CMD_BT_OPS_END) || rxData.startsWith(CMD_BT_OPS_END + String(">"))) {
+    if (!btOpsActive) {
+      btOpsAbort("no_begin");
+      return;
+    }
+    if (btOpsReceived != btOpsExpected) {
+      btOpsAbort("len_mismatch");
+      return;
+    }
+    btOpsQueueFinalize();
+    bt_NotifyStatus(CMD_BT_OPS_ACK_END);
+    PrintDebug(String("BT ops end queued (") + String(btOpsExpected) + " bytes)",
+               PRINT_BT_DEBUG);
+    return;
+  }
+
+  btOpsAbort("unknown");
+}
 void bt_NotifyStatus(const String &status) {
   if (pChar == nullptr) {
     return;
@@ -2810,6 +3225,7 @@ void bt_StartServer() {
 
   NimBLEDevice::init(myDeviceId.c_str());
   NimBLEDevice::setSecurityAuth(false, false, true);
+  NimBLEDevice::setMTU(512); // larger ATT writes for operator JSON chunks
 
   // Create Server
   pServer = NimBLEDevice::createServer();
@@ -3040,11 +3456,16 @@ void deleteOperatorsData() {
   if (LittleFS.exists(OPERATORS_JSON_FILE)) {
     LittleFS.remove(OPERATORS_JSON_FILE);
   }
+  if (LittleFS.exists(BT_OPS_TEMP_FILE)) {
+    LittleFS.remove(BT_OPS_TEMP_FILE);
+  }
 
   userCount = 0;
   maxUsersReached = false;
   memset(users, 0, sizeof(users));
   pendingOperatorsUpdate = false;
+  pendingBtOpsOkNotify = false;
+  btOpsReset(false);
 
   PrintDebug("Operators data deleted", PRINT_FLASH_DEBUG);
 }
@@ -3829,6 +4250,12 @@ void loop() {
         subCasePtr = SUB_CASE_NONE;
         break;
       }
+      // Android BLE tag enroll still allowed while unpaired
+      if (tagPresented && btTagListenActive) {
+        tagPresented = false;
+        mainCasePtr = CASE_TAG_PRESENTED;
+        break;
+      }
       startKeyPressed = false;
       stopKeyPressed = false;
       openKeyPressed = false;
@@ -4044,11 +4471,11 @@ void loop() {
   } break;
 
   // (Pairing) Start ----------------------------------------
-  // Always waits for a fresh Bluetooth credential push first (even if flash
-  // already has WiFi settings). That is required when the base WiFi/MQTT
-  // password or SSID changed — old flash creds must not skip the BT step.
+  // Prefer a fresh Bluetooth credential push (base SSID/MQTT may have changed).
+  // If none arrives within a short grace period and flash already has creds,
+  // continue with stored WiFi/MQTT so re-pair is not stuck on "BT Creds...".
   // Phases (subCasePtr):
-  //   0 = wait BT credentials
+  //   0 = wait BT credentials (or stored-cred fallback)
   //   1 = wait WiFi
   //   2 = wait MQTT / base ping
   //   3 = wait #FOUND_MONITOR
@@ -4063,11 +4490,15 @@ void loop() {
       wifiCasePtr = ssid.isEmpty() || password.isEmpty() ? 1 : 3;
     }
     isMqttServiceConnected = false;
-    // Always wait for a fresh BT credential push this pair session.
-    // Skipping this when flash still has OLD ssid/password breaks re-pair
-    // after the base WiFi/MQTT credentials change.
+    // Wait for fresh BT creds first; fallback uses flash if base never pushes.
     gotWifiCredentials = false;
-    // Clear old monitor link so re-pair cannot keep a stale monDocId
+    pairBtCredsWaitStartMs = millis();
+    // Remember prior pair link — restore on cancel/timeout so "Not Paired"
+    // is not shown after a cancelled re-pair attempt.
+    pairHadPriorLink = (settingsMonDocId[0] != '\0');
+    strlcpy(pairBackupMonDocId, settingsMonDocId, sizeof(pairBackupMonDocId));
+    strlcpy(pairBackupUserDocId, settingsUserDocId, sizeof(pairBackupUserDocId));
+    // Clear so a successful re-pair cannot keep a stale monDocId
     settingsMonDocId[0] = '\0';
     settingsUserDocId[0] = '\0';
     // Only wipe WiFi on fail if this was a first pair (no stored creds yet)
@@ -4106,10 +4537,20 @@ void loop() {
       backKeyPressed = false;
       timerAlarmDisable(timer);
       isPairing = false;
-      androidPaired = false;
       bt_NotifyStatus(CMD_BT_IDLE);
       if (clearWifiCredsOnPairFail) {
         deleteWifiCredFromFlash();
+      }
+      // Restore prior pair state (enter-pair had cleared monDocId)
+      if (pairHadPriorLink) {
+        strlcpy(settingsMonDocId, pairBackupMonDocId, sizeof(settingsMonDocId));
+        strlcpy(settingsUserDocId, pairBackupUserDocId, sizeof(settingsUserDocId));
+        androidPaired = true;
+        if (isMqttServiceConnected) {
+          digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        }
+      } else {
+        androidPaired = false;
       }
       
       PrintDebug("User Cancelled Pairing", PRINT_GENERAL_DEBUG);
@@ -4123,10 +4564,19 @@ void loop() {
     if (timeoutFlag) {
       timeoutFlag = false;
       isPairing = false;
-      androidPaired = false;
       bt_NotifyStatus(CMD_BT_IDLE);
       if (clearWifiCredsOnPairFail) {
         deleteWifiCredFromFlash();
+      }
+      if (pairHadPriorLink) {
+        strlcpy(settingsMonDocId, pairBackupMonDocId, sizeof(settingsMonDocId));
+        strlcpy(settingsUserDocId, pairBackupUserDocId, sizeof(settingsUserDocId));
+        androidPaired = true;
+        if (isMqttServiceConnected) {
+          digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        }
+      } else {
+        androidPaired = false;
       }
 
       lcdWrite("Timeout", "");
@@ -4150,21 +4600,39 @@ void loop() {
         }
       }
 
-      if (gotWifiCredentials && !ssid.isEmpty() && !password.isEmpty()) {
-        PrintDebug("Pairing: got BT credentials", PRINT_WIFI_DEBUG);
+      const bool haveStoredCreds = !ssid.isEmpty() && !password.isEmpty();
+      // Base often skips wificred when nothing changed — don't stay stuck.
+      unsigned long fallbackMs = PAIR_BT_CREDS_FALLBACK_MS;
+      if (haveStoredCreds && WiFi.status() == WL_CONNECTED &&
+          WiFi.SSID() == ssid) {
+        fallbackMs = PAIR_BT_CREDS_FALLBACK_FAST_MS;
+      }
+      const bool useStoredCreds =
+          haveStoredCreds && !gotWifiCredentials &&
+          (long)(millis() - pairBtCredsWaitStartMs) >= (long)fallbackMs;
+
+      if (useStoredCreds) {
+        PrintDebug("Pairing: using stored WiFi/MQTT creds (no BT push)",
+                   PRINT_WIFI_DEBUG);
+        gotWifiCredentials = true;
+      }
+
+      if (gotWifiCredentials && haveStoredCreds) {
+        PrintDebug(gotWifiCredentials && !useStoredCreds
+                       ? "Pairing: got BT credentials"
+                       : "Pairing: continuing with stored credentials",
+                   PRINT_WIFI_DEBUG);
         startTimout(PAIR_TIMEOUT);
 
         bool onCorrectWifi =
             (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid);
 
         if (onCorrectWifi) {
-          // Same network — only refresh MQTT / broker handshake
-          // Do not yank an in-progress ping (cases 5–8) back to reconnect
-          if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
-            gotPing = false;
-            isMqttServiceConnected = false;
-            wifiCasePtr = 5;
-          }
+          // Same network — force a fresh MQTT handshake (do not leave a
+          // half-finished case 5–8 from before pair started).
+          gotPing = false;
+          isMqttServiceConnected = false;
+          wifiCasePtr = 5;
           subCasePtr = 2;
           lcdWrite("Pairing...", "MQTT...");
         } else {
@@ -4184,20 +4652,28 @@ void loop() {
     if (subCasePtr == 1) {
       if (isWifiConnected || WiFi.status() == WL_CONNECTED) {
         isWifiConnected = true;
-        // Kick MQTT handshake only if not already mid ping/subscribe
-        if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
-          gotPing = false;
-          isMqttServiceConnected = false;
-          wifiCasePtr = 5;
-        }
+        // Always restart MQTT handshake for pairing
+        gotPing = false;
+        isMqttServiceConnected = false;
+        wifiCasePtr = 5;
         subCasePtr = 2;
         lcdWrite("Pairing...", "MQTT...");
       }
       break;
     }
 
-    // Phase 2: wait for MQTT connected + base ping
+    // Phase 2: wait for MQTT connected (+ base ping when available)
     if (subCasePtr == 2) {
+      // Keep kicking handshake if WiFi task parked outside 5–9
+      if (wifiCasePtr < 5 || wifiCasePtr == 15 || wifiCasePtr == 16) {
+        gotPing = false;
+        isMqttServiceConnected = false;
+        if (wifiCasePtr == 15) {
+          mqttBlockedByBase = false;
+        }
+        wifiCasePtr = 5;
+      }
+
       if (isMqttServiceConnected) {
         buzzerOn(1, 500, 0);
         subCasePtr = 3;
@@ -4220,6 +4696,12 @@ void loop() {
         // Paired again — restore green LED if MQTT is still up
         if (isMqttServiceConnected) {
           digitalWrite(LED_MQTT_CONNECTED, HIGH);
+        }
+
+        // Ensure tags are requested even if FOUND_MONITOR sync was missed
+        // (e.g. MQTT TX raced). Wifi task performs the actual #SYNC.
+        if (userCount == 0) {
+          pendingMqttSendSync = true;
         }
 
         PrintDebug("Monitor Found", PRINT_GENERAL_DEBUG);
@@ -4869,18 +5351,16 @@ case 35:{
       mainCasePtr++;
     }
 
-    // LCD every N ticks — counting stays in IotTask (no I2C there)
-    if (wheelTicksCount != oldWheelTicksCount) {
-      const int tickDelta = wheelTicksCount - oldWheelTicksCount;
-      if (tickDelta >= LCD_TICK_REFRESH_EVERY || tickDelta <= -LCD_TICK_REFRESH_EVERY ||
-          wheelTicksCount == 0) {
-        oldWheelTicksCount = wheelTicksCount;
-        syncWheelDistanceFromTicks();
-        oldDistance = wheelDistance;
-        char tickLine[17];
-        snprintf(tickLine, sizeof(tickLine), "Ticks: %d", wheelTicksCount);
-        lcdWrite(tickLine, "(Back,Stop)");
-      }
+    // Refresh LCD once per second with current tick count
+    static unsigned long lastCalLcdMs = 0;
+    if ((millis() - lastCalLcdMs) >= 1000UL) {
+      lastCalLcdMs = millis();
+      oldWheelTicksCount = wheelTicksCount;
+      syncWheelDistanceFromTicks();
+      oldDistance = wheelDistance;
+      char tickLine[17];
+      snprintf(tickLine, sizeof(tickLine), "Ticks: %d", wheelTicksCount);
+      lcdWrite(tickLine, "(Back,Stop)");
     }
   } break;
 
@@ -4930,7 +5410,16 @@ case 35:{
       }   
     }
 
-    if (isWifiConnected) {
+    if (btTagListenActive && pServer != nullptr &&
+        pServer->getConnectedCount() > 0) {
+      // May already have been sent from GeneralTask; only send if still armed
+      String tagHex = tagToString(tagCode);
+      bt_NotifyStatus(CMD_BT_TAG_DATA + tagHex);
+      btTagListenActive = false;
+      btLedFlashUntilTag = false;
+      btTagListenDeadlineMs = 0;
+      PrintDebug(String("BT TAG_DATA ") + tagHex, PRINT_BT_DEBUG);
+    } else if (isWifiConnected) {
       pendingMqttReportTag = true;
     }
 
