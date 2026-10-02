@@ -2970,9 +2970,9 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
     // and would leave the LED blinking forever while the link stays up.
     // Flash only when Android starts tag listen (tag:req).
 
-    // If already in pair mode, need fresh creds, or MQTT not up yet — ask Base
-    // for wificred (wrong broker IP still looks "on subnet" and used to send IDLE).
-    if (isPairing || requestFreshMqttBrokerIp || !isMqttServiceConnected) {
+    // Only ask Base for wificred when we explicitly need it.
+    // Do NOT PAIRING on every phone BLE connect (breaks cal/tag/ops acks).
+    if (isPairing || requestFreshMqttBrokerIp) {
       bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
       lastPairingNotifyMs = millis();
@@ -3028,11 +3028,9 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
     if (rxData.equalsIgnoreCase(CMD_BT_CAL_REQ) ||
         rxData.startsWith(CMD_BT_CAL_REQ)) {
       const int calTicks = hasNewCalibrateValue ? wheelTicksCount : 0;
-      wheelTicksCount = 0;
-      hasNewCalibrateValue = false;
-      resetWheelPulseState();
 
       if (calTicks <= 0) {
+        // Do not clear the latch — user can retry after rolling
         bt_NotifyStatus(CMD_BT_CAL_ERR + String("no_ticks"));
         PrintDebug("BT CAL_ERR no_ticks", PRINT_BT_DEBUG);
         return;
@@ -3056,9 +3054,7 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         // Accept any finite positive ticks/m (MQTT path clamps; do not reject
         // valid long-distance / low-tick calibrations with bad_tpm).
         if (!isfinite(tpm) || tpm <= 0.0f) {
-          // Restore latch so the user can retry without re-rolling.
-          wheelTicksCount = calTicks;
-          hasNewCalibrateValue = true;
+          // Keep latch so the user can retry without re-rolling.
           bt_NotifyStatus(CMD_BT_CAL_ERR + String("bad_tpm"));
           PrintDebug(String("BT CAL_ERR bad_tpm ticks=") + String(calTicks) +
                          String(" m=") + String(applyMeters, 3),
@@ -3075,6 +3071,10 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         appliedTpmVal = tpm;
       }
 
+      // Success only — clear tick latch after a good CAL_OK
+      wheelTicksCount = 0;
+      hasNewCalibrateValue = false;
+      resetWheelPulseState();
       calibrationCompleteUiPending = true;
       if (appliedTpm) {
         bt_NotifyStatus(CMD_BT_CAL_OK + String(calTicks) + String(">") +
@@ -3226,12 +3226,12 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
 
     PrintDebug("BT Client subscribed to notifications", PRINT_BT_DEBUG);
 
-    // Base is listening — if MQTT is not up, request wificred (do not send IDLE only)
-    if (isPairing || requestFreshMqttBrokerIp || !isMqttServiceConnected) {
+    // Base listening — only PAIRING when we need wificred (not on phone cal/tag)
+    if (isPairing || requestFreshMqttBrokerIp) {
       bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
       lastPairingNotifyMs = millis();
-      PrintDebug("BT subscribe — sent PAIRING (MQTT not ready)", PRINT_BT_DEBUG);
+      PrintDebug("BT subscribe — sent PAIRING (need wificred)", PRINT_BT_DEBUG);
     } else {
       bt_NotifyStatus(CMD_BT_IDLE);
     }
@@ -4533,6 +4533,7 @@ void loop() {
       startKeyPressed = false;
       
       if(isSessionOpen){
+        // Clear any stale ticks; real count starts when operator tag is presented
         resetWheelTickCounters();
         wheelDistance = 0;
         oldDistance = 0;
@@ -5053,9 +5054,15 @@ void loop() {
           User user = getUserNameByTag(tagCode);
           
           if(user.name[0]) {
-            // Found User
+            // Found User — start tick count immediately at tag present
             strncpy(currentIotDataWheel.operatorName, user.name, sizeof(currentIotDataWheel.operatorName) - 1);
             strncpy(currentIotDataWheel.operatorDocId, user.docId, sizeof(currentIotDataWheel.operatorDocId) - 1);
+            resetWheelTickCounters();
+            wheelDistance = 0;
+            oldDistance = 0;
+            oldWheelTicksCount = 0;
+            resetWheelPulseState();
+            PrintDebug("Measure: ticks started at operator tag", PRINT_GENERAL_DEBUG);
             subCasePtr = 4;
           } 
           else{
@@ -5101,24 +5108,27 @@ void loop() {
     
   } break;
 
-  // (Wheel) Start
+  // (Wheel) Start measure UI — ticks already running since operator tag
   case 22: {
-    if (timeoutFlag) {
+    // Do NOT reset counters here (that wiped rolls during the name delay).
+    syncWheelDistanceFromTicks();
+    oldWheelTicksCount = wheelTicksCount;
+    oldDistance = wheelDistance;
+    {
+      char line1[17];
+      char line2[17];
+      snprintf(line1, sizeof(line1), "Dist: %.2fm", wheelDistance);
+      //snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+      snprintf(line2, sizeof(line2), "     (Back,Stop)", wheelTicksCount);
+      lcdWrite(line1, line2);
+    }
+    mainCasePtr++;
+    // Arm simulation for this measure pass (stop/cancel clears it)
+    simulateWheelDistance = SIMULATE_WHEEL_DISTANCE;
+    if (simulateWheelDistance) {
+      runningTime = 0;
       timeoutFlag = false;
-      resetWheelTickCounters();
-      wheelDistance = 0;
-      oldDistance = 0;
-      oldWheelTicksCount = 0;
-      resetWheelPulseState();
-      lcdWrite("Dist: 0.00m", "T:0 (Back,Stop)");
-      mainCasePtr++;
-      // Arm simulation for this measure pass (stop/cancel clears it)
-      simulateWheelDistance = SIMULATE_WHEEL_DISTANCE;
-      if (simulateWheelDistance) {
-        runningTime = 0;
-        timeoutFlag = false;
-        timerAlarmEnable(timer);
-      }
+      timerAlarmEnable(timer);
     }
   } break;
 
@@ -5147,7 +5157,8 @@ void loop() {
         char line1[17];
         char line2[17];
         snprintf(line1, sizeof(line1), "Dist: %.2fm", wheelDistance);
-        snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+        //snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+        snprintf(line2, sizeof(line2), "     (Back,Stop)", wheelTicksCount);
         lcdWrite(line1, line2);
       }
     }
@@ -5169,7 +5180,8 @@ void loop() {
       char line1[17];
       char line2[17];
       snprintf(line1, sizeof(line1), "Dist: %.2fm", wheelDistance);
-      snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+      //snprintf(line2, sizeof(line2), "T:%d (Bk,St)", wheelTicksCount);
+      snprintf(line2, sizeof(line2), "     (Back,Stop)", wheelTicksCount);
       lcdWrite(line1, line2);
       subCasePtr = 2;
       mainCasePtr++;
