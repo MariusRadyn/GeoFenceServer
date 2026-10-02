@@ -40,7 +40,7 @@ String mqttUser = "";
 String mqttPassword = "";
 char serverIP[16];
 volatile bool pendingMqttServerUpdate = false; // wifi task: mqttServer.setServer(serverIP)
-bool requestFreshMqttBrokerIp = false;         // ask base for current broker IP over BLE
+bool requestFreshMqttBrokerIp = false; // ask Base over BLE for WiFi/MQTT creds (PAIRING)
 const int port = 8080;
 
 #define WHEEL_DEBOUNCE_DELAY 10
@@ -676,7 +676,8 @@ void setTime() {
   setenv("TZ", "SAST-2", 1); // South Africa Standard Time
   tzset();
 
-  if (getLocalTime(&timeinfo)) {
+  // Short wait — never block WiFi/MQTT boot for NTP (LAN-only bases have no NTP)
+  if (getLocalTime(&timeinfo, 200)) {
     time(&now);
     localtime_r(&now, &timeinfo);
 
@@ -1202,7 +1203,38 @@ void wifiConnectTask(void *parameter) {
 
     // Wait for Wifi Credentials via Bluetooth
     case 2: {
+      static unsigned long case2WaitStartMs = 0;
+      static unsigned long case2LastPairingMs = 0;
+      if (case2WaitStartMs == 0) {
+        case2WaitStartMs = millis();
+        case2LastPairingMs = 0;
+      }
+
+      // Keep advertising + ask Base for wificred while we wait
+      if (requestFreshMqttBrokerIp || !gotWifiCredentials) {
+        if (pServer != nullptr && pServer->getConnectedCount() == 0) {
+          static unsigned long lastAdvMs = 0;
+          if ((millis() - lastAdvMs) > 5000UL) {
+            lastAdvMs = millis();
+            bt_StartAdvertising();
+          }
+        }
+        if (isBluetoothConnected &&
+            (case2LastPairingMs == 0 ||
+             (millis() - case2LastPairingMs) >= PAIRING_NOTIFY_RETRY_MS)) {
+          requestFreshMqttBrokerIp = true;
+          bt_NotifyStatus(CMD_BT_IDLE);
+          bt_NotifyStatus(CMD_BT_PAIRING);
+          case2LastPairingMs = millis();
+          lastPairingNotifyMs = case2LastPairingMs;
+          PrintDebug("Waiting for WiFi creds — sent PAIRING to Base",
+                     PRINT_WIFI_DEBUG);
+        }
+      }
+
       if (gotWifiCredentials) {
+        case2WaitStartMs = 0;
+        case2LastPairingMs = 0;
         PrintDebug("Got Wifi Credentials ... ", PRINT_WIFI_DEBUG);
         PrintDebug("SSID: " + ssid, PRINT_WIFI_DEBUG);
        
@@ -1215,7 +1247,21 @@ void wifiConnectTask(void *parameter) {
           isWifiConnected = false;
           wifiCasePtr = 3;
         }
+      } else if (WiFi.status() == WL_CONNECTED && serverIP[0] == '\0' &&
+                 (millis() - case2WaitStartMs) > 10000UL) {
+        // Escape hatch: still no BT push — try gateway as broker
+        IPAddress gw = WiFi.gatewayIP();
+        if (gw[0] != 0) {
+          snprintf(serverIP, sizeof(serverIP), "%u.%u.%u.%u", gw[0], gw[1],
+                   gw[2], gw[3]);
+          PrintDebug(String("BT creds timeout — MQTT via gateway ") + serverIP,
+                     PRINT_WIFI_DEBUG);
+          case2WaitStartMs = 0;
+          isWifiConnected = true;
+          wifiCasePtr = 4;
+        }
       }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
     } break;
 
     // Connecting Wifi
@@ -1262,34 +1308,76 @@ void wifiConnectTask(void *parameter) {
           bt_StartAdvertising();
         }
 
-        // Stale flash broker IP after hotspot subnet change (e.g. 10.35.x vs 10.134.x)
+        // Prefer a fresh broker IP from Base over BLE when subnet looks wrong,
+        // but never skip MQTT — that left wheels silent after power-up.
         if (serverIP[0] != '\0' && !mqttBrokerOnLocalSubnet()) {
-          PrintDebug(String("MQTT IP outdated: ") + serverIP +
-                         " (LAN " + ip + ") — request BT credentials",
+          PrintDebug(String("MQTT IP may be outdated: ") + serverIP +
+                         " (LAN " + ip + ") — refresh via BT when linked",
                      PRINT_WIFI_DEBUG);
-          gotWifiCredentials = false;
           requestFreshMqttBrokerIp = true;
           if (isBluetoothConnected) {
             bt_NotifyStatus(CMD_BT_PAIRING);
           }
+        }
+
+        // No broker IP in flash: try WiFi gateway (Base-as-AP / many hotspots)
+        if (serverIP[0] == '\0') {
+          IPAddress gw = WiFi.gatewayIP();
+          if (gw[0] != 0) {
+            snprintf(serverIP, sizeof(serverIP), "%u.%u.%u.%u", gw[0], gw[1],
+                     gw[2], gw[3]);
+            PrintDebug(String("No MQTT IP in flash — trying gateway ") +
+                           serverIP,
+                       PRINT_WIFI_DEBUG);
+          }
+          requestFreshMqttBrokerIp = true;
+          if (isBluetoothConnected) {
+            bt_NotifyStatus(CMD_BT_PAIRING);
+          }
+        }
+
+        if (serverIP[0] == '\0') {
+          PrintDebug("No MQTT broker IP — waiting for BT credentials",
+                     PRINT_WIFI_DEBUG);
+          gotWifiCredentials = false;
+          requestFreshMqttBrokerIp = true;
           wifiCasePtr = 2;
           break;
         }
 
-        PrintDebug(String("Start MQTT ... ") + serverIP + ":1883",
+        PrintDebug(String("Start MQTT ... ") + serverIP + ":1883 user=" +
+                       (mqttUser.isEmpty() ? "(none)" : mqttUser),
                    PRINT_WIFI_DEBUG);
         mqttServer.setServer(serverIP, 1883);
         mqttServer.setCallback(mqttRx);
-
-        setTime();
-        wifiCasePtr++;
+        // NTP after MQTT — do not delay broker connect on LAN-only networks
+        wifiCasePtr = 5;
       } else {
-        // Still associating — retry begin if stalled (e.g. back from out of range)
+        // Still associating — after timeout, ask Base for fresh WiFi creds over BLE
+        // (wrong SSID/password in flash will never succeed by retrying alone).
         if (wifiConnectStartedMs == 0) {
           wifiConnectStartedMs = millis();
         } else if ((millis() - wifiConnectStartedMs) > 20000UL) {
-          PrintDebug("WiFi connect timeout — retry", PRINT_WIFI_DEBUG);
-          wifiCasePtr = 3;
+          PrintDebug(
+              String("WiFi failed (ssid=") + ssid +
+                  ") — requesting credentials from Base over BLE",
+              PRINT_WIFI_DEBUG);
+          wifiConnectStartedMs = 0;
+          gotWifiCredentials = false;
+          requestFreshMqttBrokerIp = true;
+          digitalWrite(LED_WIFI_CONNECTED, LOW);
+
+          // Make sure Base can see / reconnect to us
+          if (pServer != nullptr && pServer->getConnectedCount() == 0) {
+            bt_StartAdvertising();
+          }
+          if (isBluetoothConnected) {
+            bt_NotifyStatus(CMD_BT_IDLE);
+            bt_NotifyStatus(CMD_BT_PAIRING);
+            lastPairingNotifyMs = millis();
+          }
+
+          wifiCasePtr = 2; // wait for wificred via BLE
         }
         vTaskDelay(100 / portTICK_PERIOD_MS);
       }
@@ -1298,6 +1386,7 @@ void wifiConnectTask(void *parameter) {
     // Connecting MQTT
     case 5: {
       if (mqttBlockedByBase) {
+        PrintDebug("MQTT blocked by SHOESH — waiting for pair", PRINT_WIFI_DEBUG);
         wifiCasePtr = 15;
         break;
       }
@@ -1310,6 +1399,7 @@ void wifiConnectTask(void *parameter) {
 
       mqttServer.setBufferSize(MQTT_RX_BUFFER_SIZE);
       mqttServer.setCallback(mqttRx);
+      mqttServer.setServer(serverIP, 1883);
 
       // Re-pair / forced handshake: drop stale broker session so DEVICE_ID +
       // subscribe + PING actually run (connect() is a no-op if already up).
@@ -1318,21 +1408,51 @@ void wifiConnectTask(void *parameter) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
       }
 
+      PrintDebug(String("MQTT connect attempt → ") + serverIP + ":1883",
+                 PRINT_WIFI_DEBUG);
       if (mqttConnect()) {
         PrintDebug("MQTT Connected", PRINT_WIFI_DEBUG);
 
         mqttServiceLoop();
         mqttReportMyID();
         showMqttWarning = true;
+        requestFreshMqttBrokerIp = false;
+        setTime(); // best-effort clock; already online
 
         wifiCasePtr++;
       } else {
-        if(showMqttWarning){
-          showMqttWarning = false;
-          PrintDebug("MQTT FAILED: " + String(mqttServer.state()),
-          PRINT_WIFI_DEBUG);
+        static uint8_t mqttFailStreak = 0;
+        mqttFailStreak++;
+        PrintDebug(String("MQTT FAILED state=") + String(mqttServer.state()) +
+                       " ip=" + serverIP + " streak=" + String(mqttFailStreak),
+                   PRINT_WIFI_DEBUG);
+
+        // Broker unreachable / wrong IP or MQTT user — ask Base for fresh
+        // wificred over BLE (same /24 does not mean the broker is alive).
+        requestFreshMqttBrokerIp = true;
+        if (isBluetoothConnected &&
+            (lastPairingNotifyMs == 0 ||
+             (millis() - lastPairingNotifyMs) >= PAIRING_NOTIFY_RETRY_MS)) {
+          bt_NotifyStatus(CMD_BT_IDLE);
+          bt_NotifyStatus(CMD_BT_PAIRING);
+          lastPairingNotifyMs = millis();
+          PrintDebug("MQTT down — sent PAIRING (request wificred from Base)",
+                     PRINT_WIFI_DEBUG);
+        } else if (!isBluetoothConnected && pServer != nullptr &&
+                   pServer->getConnectedCount() == 0) {
+          bt_StartAdvertising();
         }
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+        // After several fails, also wait in case 2 so PAIRING is polled hard
+        if (mqttFailStreak >= 3) {
+          mqttFailStreak = 0;
+          gotWifiCredentials = false;
+          PrintDebug("MQTT still failing — waiting for BLE wificred",
+                     PRINT_WIFI_DEBUG);
+          wifiCasePtr = 2;
+          break;
+        }
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
       }
     } break;
 
@@ -2850,8 +2970,9 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
     // and would leave the LED blinking forever while the link stays up.
     // Flash only when Android starts tag listen (tag:req).
 
-    // If already in pair mode, tell the base immediately (IDLE→PAIRING edge)
-    if (isPairing || requestFreshMqttBrokerIp) {
+    // If already in pair mode, need fresh creds, or MQTT not up yet — ask Base
+    // for wificred (wrong broker IP still looks "on subnet" and used to send IDLE).
+    if (isPairing || requestFreshMqttBrokerIp || !isMqttServiceConnected) {
       bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
       lastPairingNotifyMs = millis();
@@ -3075,8 +3196,8 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
           gotPing = false;
           WiFi.disconnect(false);
           wifiCasePtr = 3;
-        } else if (wifiCasePtr < 5 || wifiCasePtr >= 9) {
-          // Same AP — start MQTT handshake only if not already in progress
+        } else {
+          // Same AP — always re-run MQTT handshake (broker IP/user may have changed)
           isMqttServiceConnected = false;
           gotPing = false;
           wifiCasePtr = 5;
@@ -3086,8 +3207,8 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
         if (isPairing && !btWifiOkNotified) {
           btWifiOkNotified = true;
           bt_NotifyStatus(CMD_BT_WIFI_OK);
-        } else if (!isPairing && !newIPMatch) {
-          // IP refresh without full pair UI
+        } else if (!isPairing) {
+          // IP/MQTT refresh without full pair UI
           bt_NotifyStatus(CMD_BT_WIFI_OK);
         }
       } else {
@@ -3105,11 +3226,12 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
 
     PrintDebug("BT Client subscribed to notifications", PRINT_BT_DEBUG);
 
-    // Base is listening — push current pairing state (force notify edge)
-    if (isPairing || requestFreshMqttBrokerIp) {
+    // Base is listening — if MQTT is not up, request wificred (do not send IDLE only)
+    if (isPairing || requestFreshMqttBrokerIp || !isMqttServiceConnected) {
       bt_NotifyStatus(CMD_BT_IDLE);
       bt_NotifyStatus(CMD_BT_PAIRING);
       lastPairingNotifyMs = millis();
+      PrintDebug("BT subscribe — sent PAIRING (MQTT not ready)", PRINT_BT_DEBUG);
     } else {
       bt_NotifyStatus(CMD_BT_IDLE);
     }
