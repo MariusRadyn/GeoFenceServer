@@ -145,6 +145,16 @@ const String CMD_BT_TAG_CANCEL = "tag:cancel";
 const String CMD_BT_TAG_ACK_LISTEN = "TAG_ACK>LISTEN";
 const String CMD_BT_TAG_ACK_CANCEL = "TAG_ACK>CANCEL";
 const String CMD_BT_TAG_DATA = "TAG_DATA>";
+// Android wheel calibrate / ticksPerM push over BLE (no WiFi / base):
+//   write cal:req              → CAL_OK><ticks>           or CAL_ERR>no_ticks
+//   write cal:req><meters>     → CAL_OK><ticks>><tpm>     (applies ticks/m)
+//   write set:tpm><float>      → SET_OK><tpm>             or SET_ERR>bad_tpm
+const String CMD_BT_CAL_REQ = "cal:req";
+const String CMD_BT_CAL_OK = "CAL_OK>";
+const String CMD_BT_CAL_ERR = "CAL_ERR>";
+const String CMD_BT_SET_TPM = "set:tpm>";
+const String CMD_BT_SET_OK = "SET_OK>";
+const String CMD_BT_SET_ERR = "SET_ERR>";
 volatile bool btTagListenActive = false;
 unsigned long btTagListenDeadlineMs = 0;
 #define BT_TAG_LISTEN_TIMEOUT_MS 60000UL
@@ -2836,9 +2846,9 @@ class BT_ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) {
     PrintDebug("BT Client connected", PRINT_BT_DEBUG);
     isBluetoothConnected = true;
-    // Confirm link for phone tag sync / device pick
-    buzzerOn(2, 100, 100);
-    btLedFlashUntilTag = true;
+    // Do NOT flash blue / beep here — Base reconnects after every power cycle
+    // and would leave the LED blinking forever while the link stays up.
+    // Flash only when Android starts tag listen (tag:req).
 
     // If already in pair mode, tell the base immediately (IDLE→PAIRING edge)
     if (isPairing || requestFreshMqttBrokerIp) {
@@ -2875,7 +2885,9 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
     if (rxData.equalsIgnoreCase(CMD_BT_TAG_REQ) ||
         rxData.startsWith(CMD_BT_TAG_REQ)) {
       btTagListenActive = true;
+      btLedFlashUntilTag = true;
       btTagListenDeadlineMs = millis() + BT_TAG_LISTEN_TIMEOUT_MS;
+      buzzerOn(2, 100, 100); // ready to present tag
       bt_NotifyStatus(CMD_BT_TAG_ACK_LISTEN);
       PrintDebug("BT tag listen ON", PRINT_BT_DEBUG);
       return;
@@ -2887,6 +2899,95 @@ class BT_HandshakeCallbacks : public NimBLECharacteristicCallbacks {
       btLedFlashUntilTag = false;
       bt_NotifyStatus(CMD_BT_TAG_ACK_CANCEL);
       PrintDebug("BT tag listen OFF", PRINT_BT_DEBUG);
+      return;
+    }
+
+    // Android calibrate over BLE (same tick latch as MQTT #CALIBRATE).
+    // Optional: cal:req><meters> applies ticksPerM in the same step.
+    if (rxData.equalsIgnoreCase(CMD_BT_CAL_REQ) ||
+        rxData.startsWith(CMD_BT_CAL_REQ)) {
+      const int calTicks = hasNewCalibrateValue ? wheelTicksCount : 0;
+      wheelTicksCount = 0;
+      hasNewCalibrateValue = false;
+      resetWheelPulseState();
+
+      if (calTicks <= 0) {
+        bt_NotifyStatus(CMD_BT_CAL_ERR + String("no_ticks"));
+        PrintDebug("BT CAL_ERR no_ticks", PRINT_BT_DEBUG);
+        return;
+      }
+
+      float applyMeters = 0.0f;
+      // Payload is "cal:req" or "cal:req><meters>" (first '>' separates meters).
+      if (rxData.length() > (int)CMD_BT_CAL_REQ.length() &&
+          rxData.charAt(CMD_BT_CAL_REQ.length()) == '>') {
+        String metersStr = rxData.substring(CMD_BT_CAL_REQ.length() + 1);
+        metersStr.trim();
+        if (metersStr.length() > 0) {
+          applyMeters = metersStr.toFloat();
+        }
+      }
+
+      bool appliedTpm = false;
+      float appliedTpmVal = 0.0f;
+      if (applyMeters > 0.0f) {
+        float tpm = (float)calTicks / applyMeters;
+        // Accept any finite positive ticks/m (MQTT path clamps; do not reject
+        // valid long-distance / low-tick calibrations with bad_tpm).
+        if (!isfinite(tpm) || tpm <= 0.0f) {
+          // Restore latch so the user can retry without re-rolling.
+          wheelTicksCount = calTicks;
+          hasNewCalibrateValue = true;
+          bt_NotifyStatus(CMD_BT_CAL_ERR + String("bad_tpm"));
+          PrintDebug(String("BT CAL_ERR bad_tpm ticks=") + String(calTicks) +
+                         String(" m=") + String(applyMeters, 3),
+                     PRINT_BT_DEBUG);
+          return;
+        }
+        if (tpm > 10000.0f) {
+          tpm = 10000.0f;
+        }
+        settingsTicksPerMeter = tpm;
+        newSettingsRecieved = true;
+        syncSettingsUiPending = true;
+        appliedTpm = true;
+        appliedTpmVal = tpm;
+      }
+
+      calibrationCompleteUiPending = true;
+      if (appliedTpm) {
+        bt_NotifyStatus(CMD_BT_CAL_OK + String(calTicks) + String(">") +
+                        String(appliedTpmVal, 4));
+        PrintDebug(String("BT CAL_OK ticks=") + String(calTicks) +
+                       String(" tpm=") + String(appliedTpmVal, 4),
+                   PRINT_BT_DEBUG);
+      } else {
+        bt_NotifyStatus(CMD_BT_CAL_OK + String(calTicks));
+        PrintDebug(String("BT CAL_OK ticks=") + String(calTicks), PRINT_BT_DEBUG);
+      }
+      return;
+    }
+
+    // Android push ticksPerM over BLE (field calibrate without MQTT)
+    if (rxData.startsWith(CMD_BT_SET_TPM)) {
+      String val = rxData.substring(CMD_BT_SET_TPM.length());
+      val.trim();
+      float tpm = val.toFloat();
+      if (!isfinite(tpm) || tpm <= 0.0f) {
+        bt_NotifyStatus(CMD_BT_SET_ERR + String("bad_tpm"));
+        PrintDebug(String("BT SET_ERR bad_tpm raw=") + val, PRINT_BT_DEBUG);
+        return;
+      }
+      if (tpm > 10000.0f) {
+        tpm = 10000.0f;
+      }
+      settingsTicksPerMeter = tpm;
+      newSettingsRecieved = true;
+      syncSettingsUiPending = true;
+      resetWheelPulseState();
+      bt_NotifyStatus(CMD_BT_SET_OK + String(settingsTicksPerMeter, 4));
+      PrintDebug(String("BT SET_OK ticksPerM=") + String(settingsTicksPerMeter, 4),
+                 PRINT_BT_DEBUG);
       return;
     }
 
